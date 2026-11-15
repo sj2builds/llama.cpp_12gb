@@ -401,6 +401,10 @@ struct llama_layer {
     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
     struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
 
+    // DSpine code bridge (per-layer read / write)
+    struct ggml_tensor * dspine_read  = nullptr;
+    struct ggml_tensor * dspine_write = nullptr;
+
     struct ggml_tensor * lilicorr_attn_norm       = nullptr;
     struct ggml_tensor * lilicorr_mlp_norm        = nullptr;
     struct ggml_tensor * lilicorr_attn_in_proj    = nullptr;
@@ -703,6 +707,10 @@ struct llama_hadamard {
 
     llama_hadamard_rotations rot; // folded weight -> activation transform
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
+
+    // EXL3 weight -> (suh, svh): its input / output sign-scale vectors, attached to the matmul as src[2] / src[3]
+    // (the Hadamard transforms of EXL3 run inside the CUDA kernel, see ggml-cuda/exl3.cuh)
+    std::unordered_map<const ggml_tensor *, std::pair<ggml_tensor *, ggml_tensor *>> exl3;
 };
 
 struct llama_model {
@@ -792,6 +800,13 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
+
+    // DSpine code bridge
+    struct ggml_tensor * dspine_codebook  = nullptr;
+    struct ggml_tensor * dspine_gate      = nullptr;
+    struct ggml_tensor * dspine_gate_b    = nullptr;
+    struct ggml_tensor * dspine_pred_gate = nullptr;
+    struct ggml_tensor * dspine_prev      = nullptr;
 
     struct ggml_tensor * lilicorr_token_proj          = nullptr;
     struct ggml_tensor * lilicorr_token_proj_b        = nullptr;

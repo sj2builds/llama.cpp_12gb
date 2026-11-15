@@ -430,7 +430,16 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // EXL3 trellis tensors (exllamav3 format, mul1 codebook), K = 1..8 bits per weight; local fork types
+        GGML_TYPE_EXL3_1  = 43,
+        GGML_TYPE_EXL3_2  = 44,
+        GGML_TYPE_EXL3_3  = 45,
+        GGML_TYPE_EXL3_4  = 46,
+        GGML_TYPE_EXL3_5  = 47,
+        GGML_TYPE_EXL3_6  = 48,
+        GGML_TYPE_EXL3_7  = 49,
+        GGML_TYPE_EXL3_8  = 50,
+        GGML_TYPE_COUNT   = 51,
     };
 
     // [TAG_GGML_PREC]
@@ -775,6 +784,7 @@ extern "C" {
     GGML_API size_t  ggml_element_size(const struct ggml_tensor * tensor);
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
+    GGML_API int     ggml_exl3_bits   (enum ggml_type type); // bits per weight of an EXL3 type, 0 for any other type
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);

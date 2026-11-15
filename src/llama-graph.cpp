@@ -39,7 +39,10 @@ static ggml_tensor * build_attn_inp_kq_mask(
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+    // R2-5g item 1: one mask plane per KV layer when LLAMA_STRIP_KV_RANGES_L is set (single stream only)
+    const int64_t n_plane = llama_kv_cache_context::kv_layers_supported(n_stream) ? mctx->get_n_layers_kv() : 1;
+
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, n_plane, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
@@ -59,7 +62,7 @@ static bool can_reuse_kq_mask(
 
     res &= (kq_mask->ne[0] == n_kv);
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
-    res &= (kq_mask->ne[2] == 1);
+    res &= (kq_mask->ne[2] == (llama_kv_cache_context::kv_layers_supported(n_stream) ? mctx->get_n_layers_kv() : 1));
     res &= (kq_mask->ne[3] == n_stream);
 
     return res;
@@ -548,7 +551,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
     if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        if (llama_kv_cache_context::kv_layers_supported(self_kq_mask->ne[3])) {
+            mctx->set_input_kq_mask_layered(self_kq_mask, ubatch, cparams.causal_attn);
+        } else {
+            mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        }
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -1633,6 +1640,27 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     cur = build_hadamard_input(w, cur);
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
+    // EXL3 weight: the kernel reads its sign/scale vectors from src[2] / src[3]. A weight borrowed from the paired
+    // model (e.g. the DFlash drafter using the target's lm_head) is found in that model's map.
+    if (ggml_exl3_bits(w->type) > 0) {
+        const llama_hadamard * owners[2] = {
+            hdmd,
+            cparams.ctx_other ? &llama_get_model(cparams.ctx_other)->hdmd : nullptr,
+        };
+        for (const llama_hadamard * h : owners) {
+            if (h == nullptr) {
+                continue;
+            }
+            const auto it = h->exl3.find(w);
+            if (it != h->exl3.end()) {
+                res->src[2] = it->second.first;
+                res->src[3] = it->second.second;
+                break;
+            }
+        }
+        GGML_ASSERT(res->src[2] != nullptr && "EXL3 weight without its sign/scale vectors");
+    }
+
     if (prec_policy) {
         prec_policy->apply(res);
     }
@@ -1672,6 +1700,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
+    GGML_ASSERT(ggml_exl3_bits(w->type) == 0 && "EXL3 expert weights are not supported");
     cur = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
@@ -3141,6 +3170,17 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+        // R2-5g item 1: one mask view per KV layer when the per-layer ranges are enabled
+        const int64_t n_stream_l = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+        if (llama_kv_cache_context::kv_layers_supported(n_stream_l)) {
+            const int32_t n_layers_kv = mctx_cur->get_n_layers_kv();
+            inp->layer_ids_kv = mctx_cur->get_layer_ids_kv();
+            ggml_tensor * m = inp->self_kq_mask_cnv;
+            for (int32_t l = 0; l < n_layers_kv; ++l) {
+                inp->self_kq_mask_layers.push_back(
+                    ggml_view_3d(ctx0, m, m->ne[0], m->ne[1], 1, m->nb[1], m->nb[2], (size_t) l * m->nb[2]));
+            }
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -3212,7 +3252,7 @@ ggml_tensor * llm_graph_context::build_attn(
         v = mctx_cur->get_v(ctx0, il);
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->get_kq_mask_l(il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);

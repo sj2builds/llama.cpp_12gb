@@ -1934,6 +1934,24 @@ private:
 
             bool use_backend_sampling = task.params.sampling.backend_sampling;
 
+            // LLAMA_GPU_ARGMAX=1 (opt-in): for a plain greedy request, run the pick on the GPU for the target's
+            // verify columns too (the drafter already samples on the backend by default). Then only the token id
+            // crosses the bus instead of n_cols x n_vocab logits per step, and common_sampler_sample() returns the
+            // backend's token without touching the logits. Restricted to the sampling shapes where the backend
+            // chain provably equals the CPU one: temperature 0, no penalty/DRY/XTC/adaptive/mirostat/grammar/bias.
+            {
+                static const bool gpu_argmax = getenv("LLAMA_GPU_ARGMAX") != nullptr;
+                const auto & sp = task.params.sampling;
+                const bool plain_greedy = sp.temp <= 0.0f && sp.penalty_last_n == 64 && sp.penalty_repeat == 1.0f &&
+                    sp.penalty_freq == 0.0f && sp.penalty_present == 0.0f && sp.dry_multiplier == 0.0f &&
+                    sp.xtc_probability == 0.0f && sp.adaptive_target < 0.0f && sp.mirostat == 0 &&
+                    sp.dynatemp_range == 0.0f && sp.grammar.type == COMMON_GRAMMAR_TYPE_NONE && sp.logit_bias.empty() &&
+                    sp.grammar_triggers.empty();
+                if (gpu_argmax && plain_greedy) {
+                    use_backend_sampling = true;
+                }
+            }
+
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
@@ -4408,6 +4426,27 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off) {
+        // R3-6 Cut 3 probe, opt-in via LLAMA_POST_TIMING=1 (default off: nothing below runs).
+        // Splits post_decode() into samp (verify: sample-and-accept incl. the logits reads),
+        // ckpt (rollback/checkpoint restore), piece (detokenize per emitted token) and
+        // proc (the rest of the per-token work: stop checks + send_partial_response).
+        static const bool post_timing = [] {
+            const char * e = getenv("LLAMA_POST_TIMING");
+            return e != nullptr && e[0] != '\0' && atoi(e) != 0;
+        }();
+        const int64_t t_post_beg = post_timing ? ggml_time_us() : 0;
+        int64_t t_first = 0;
+        int64_t t_lambda = 0;
+        int64_t t_smp   = 0;
+        int64_t t_clone = 0;
+        int64_t t_acc   = 0;
+        int64_t t_tok   = 0;
+        int64_t t_rm    = 0;
+        int64_t t_ckpt  = 0;
+        int64_t t_piece = 0;
+        int64_t t_proc  = 0;
+        int64_t n_emit  = 0;
+
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -4428,10 +4467,10 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        const int64_t t_first_beg = post_timing ? ggml_time_us() : 0;
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
-            if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
-                if (slot.task->params.stream && slot.task->params.return_progress) {
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {                if (slot.task->params.stream && slot.task->params.return_progress) {
                     send_partial_response(slot, {}, true);
                 }
             }
@@ -4526,6 +4565,7 @@ private:
 
             slot.print_timings_tg();
         });
+        const int64_t t_lambda_beg = post_timing ? ggml_time_us() : 0;
 
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
@@ -4540,8 +4580,25 @@ private:
             GGML_ASSERT(n_draft > 0);
 
             // verify and try to accept the draft
+            const int64_t t_smp_beg = post_timing ? ggml_time_us() : 0;
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // R3-6 Cut 3 (opt-in LLAMA_SPEC_LAZY_SMPL=1): the sampler snapshot below is only read by
+                // the checkpoint-restore rollback, which needs n_rollback > n_rs_seq. n_rollback is at most
+                // n_draft (the bonus token is always accepted), so a plain-partial context, or an RS window
+                // of at least n_draft, can never take that path and the clone is pure waste - it copies the
+                // whole n_vocab-sized candidate set on every speculative step.
+                static const bool lazy_smpl = [] {
+                    const char * e = getenv("LLAMA_SPEC_LAZY_SMPL");
+                    return e != nullptr && e[0] != '\0' && atoi(e) != 0;
+                }();
+                const bool may_need_smpl_snapshot = !lazy_smpl ||
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > (size_t) llama_n_rs_seq(ctx_tgt));
+                const int64_t t_clone_beg = post_timing ? ggml_time_us() : 0;
+                common_sampler_ptr smpl_save(may_need_smpl_snapshot ? common_sampler_clone(slot.smpl.get(), /*with_candidates=*/!lazy_smpl) : nullptr);
+                if (post_timing) {
+                    t_clone += ggml_time_us() - t_clone_beg;
+                }
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -4551,6 +4608,7 @@ private:
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
                 std::vector<llama_token> accepted;
+                const int64_t t_acc_beg = post_timing ? ggml_time_us() : 0;
                 if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
                     accepted = server_sample_and_accept_synth(
@@ -4562,6 +4620,41 @@ private:
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
+                if (post_timing) {
+                    t_acc += ggml_time_us() - t_acc_beg;
+                }
+                // Opt-in diagnostic (LLAMA_SPEC_LOG=<file>): for every PROPOSED draft position, the target's
+                // rank of that token and the log-prob gap to the target's own top-1. Default path: one getenv.
+                if (const char * spec_log = getenv("LLAMA_SPEC_LOG")) {
+                    static FILE * fspec = nullptr;
+                    if (fspec == nullptr) {
+                        fspec = fopen(spec_log, "w");
+                        if (fspec != nullptr) {
+                            fprintf(fspec, "step,pos,draft_token,rank,logit_gap,accepted\n");
+                        }
+                    }
+                    if (fspec != nullptr) {
+                        const llama_vocab * vv = llama_model_get_vocab(llama_get_model(slot.ctx_tgt));
+                        const int n_vocab = (int) llama_vocab_n_tokens(vv);
+                        const int n_acc = (int) accepted.size() - 1;
+                        static int n_step = 0;
+                        for (size_t i = 0; i < slot.spec_draft.size() && i < slot.spec_i_batch.size(); ++i) {
+                            const llama_token dt = slot.spec_draft[i];
+                            const float * lg = llama_get_logits_ith(slot.ctx_tgt, slot.spec_i_batch[i]);
+                            if (lg == nullptr) continue;
+                            float m1 = -1e30f; int i1 = -1; int rank = 0;
+                            for (int v = 0; v < n_vocab; ++v) {
+                                if (lg[v] > m1) { m1 = lg[v]; i1 = v; }
+                            }
+                            const float ld = lg[dt];
+                            for (int v = 0; v < n_vocab; ++v) { if (lg[v] > ld) ++rank; }
+                            fprintf(fspec, "%d,%zu,%d,%d,%.6f,%d\n", n_step, i, (int) dt, rank,
+                                    (double) (m1 - ld), (i < (size_t) n_acc) ? 1 : 0);
+                        }
+                        fflush(fspec);
+                        ++n_step;
+                    }
                 }
                 slot.spec_i_batch.clear();
 
@@ -4588,6 +4681,7 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
+                        const int64_t t_ckpt_beg = post_timing ? ggml_time_us() : 0;
                         GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 
                         if (slot.ctx_dft) {
@@ -4597,8 +4691,14 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        GGML_ASSERT(smpl_save != nullptr && "checkpoint rollback needs the sampler snapshot");
+                        // lazy snapshot: the candidate buffer is left alone, set_logits() rebuilds it before
+                        // the next sample, so only the sampler state (chain/prev/rng) needs restoring here
+                        common_sampler_copy(smpl_save.get(), slot.smpl.get(), /*with_candidates=*/!lazy_smpl);
 
+                        if (post_timing) {
+                            t_ckpt += ggml_time_us() - t_ckpt_beg;
+                        }
                         return;
                     }
                 }
@@ -4610,6 +4710,9 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+            }
+            if (post_timing) {
+                t_smp += ggml_time_us() - t_smp_beg;
             }
 
             const auto ids = std::move(slot.spec_draft);
@@ -4635,26 +4738,44 @@ private:
             }
 
             // add accepted tokens to the prompt
+            const int64_t t_tok_beg = post_timing ? ggml_time_us() : 0;
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+            if (post_timing) {
+                t_tok += ggml_time_us() - t_tok_beg;
+            }
 
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+            const int64_t t_rm_beg = post_timing ? ggml_time_us() : 0;
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (post_timing) {
+                t_rm += ggml_time_us() - t_rm_beg;
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
-                result.tok          = ids[i];
+                result.tok = ids[i];
+                const int64_t t_piece_beg = post_timing ? ggml_time_us() : 0;
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
+                const int64_t t_proc_beg = post_timing ? ggml_time_us() : 0;
+                if (post_timing) {
+                    t_piece += t_proc_beg - t_piece_beg;
+                    n_emit++;
+                }
 
                 // TODO: set result.probs
 
                 slot.stats.n_gen += 1;
 
-                if (!process_token(result, slot)) {
+                const bool keep_going = process_token(result, slot);
+                if (post_timing) {
+                    t_proc += ggml_time_us() - t_proc_beg;
+                }
+                if (!keep_going) {
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();
@@ -4667,6 +4788,19 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+
+        if (post_timing) {
+            const int64_t t_end = ggml_time_us();
+            const int64_t t_pre_spec = t_lambda_beg - t_post_beg;
+            const int64_t t_spec = t_end - t_lambda_beg;
+            const int64_t t_rest = t_spec - (t_smp + t_tok + t_rm + t_piece + t_proc);
+            fprintf(stderr, "POSTTIME samp=%.3f clone=%.3f acc=%.3f ckpt=%.3f tok=%.3f rm=%.3f piece=%.3f proc=%.3f "
+                            "emit=%.3f rest=%.3f first=%.3f total=%.3f ntok=%d\n",
+                    t_smp / 1e3, t_clone / 1e3, t_acc / 1e3, t_ckpt / 1e3, t_tok / 1e3, t_rm / 1e3,
+                    t_piece / 1e3, t_proc / 1e3, (t_piece + t_proc) / 1e3, t_rest / 1e3, t_pre_spec / 1e3,
+                    (t_end - t_post_beg) / 1e3, (int) n_emit);
+            fflush(stderr);
+        }
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model

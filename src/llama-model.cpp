@@ -1865,6 +1865,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
+    hdmd.exl3 = ml.exl3_aux;
+    if (!hdmd.exl3.empty()) {
+        LLAMA_LOG_INFO("%s: %zu EXL3 weights\n", __func__, hdmd.exl3.size());
+    }
+
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
 

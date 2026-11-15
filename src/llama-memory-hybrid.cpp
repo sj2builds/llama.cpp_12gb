@@ -141,12 +141,22 @@ void llama_memory_hybrid::clear(bool data) {
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // R3-6 Cut 3 probe, opt-in via LLAMA_MEM_TIMING=1: split the rollback into the recurrent part
+    // (which with LLAMA_RS_REPLAY=1 materializes the state by replay) and the attention cell scan.
+    static const bool t_mem = getenv("LLAMA_MEM_TIMING") != nullptr;
+    const int64_t t0 = t_mem ? ggml_time_us() : 0;
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
-    return mem_attn->seq_rm(seq_id, p0, p1);
+    const int64_t t1 = t_mem ? ggml_time_us() : 0;
+    const bool res = mem_attn->seq_rm(seq_id, p0, p1);
+    if (t_mem) {
+        fprintf(stderr, "MEMTIME recr=%.3f attn=%.3f p0=%d\n", (t1 - t0) / 1e3, (ggml_time_us() - t1) / 1e3, (int) p0);
+        fflush(stderr);
+    }
+    return res;
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {

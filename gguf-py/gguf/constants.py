@@ -6225,6 +6225,14 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    EXL3_1  = 43  # local fork: EXL3 trellis tensors, K bits per weight
+    EXL3_2  = 44
+    EXL3_3  = 45
+    EXL3_4  = 46
+    EXL3_5  = 47
+    EXL3_6  = 48
+    EXL3_7  = 49
+    EXL3_8  = 50
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6442,6 +6450,14 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.EXL3_1:  (256, 32 * 1),
+    GGMLQuantizationType.EXL3_2:  (256, 32 * 2),
+    GGMLQuantizationType.EXL3_3:  (256, 32 * 3),
+    GGMLQuantizationType.EXL3_4:  (256, 32 * 4),
+    GGMLQuantizationType.EXL3_5:  (256, 32 * 5),
+    GGMLQuantizationType.EXL3_6:  (256, 32 * 6),
+    GGMLQuantizationType.EXL3_7:  (256, 32 * 7),
+    GGMLQuantizationType.EXL3_8:  (256, 32 * 8),
 }
 
 

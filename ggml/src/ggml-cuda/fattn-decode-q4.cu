@@ -21,6 +21,12 @@
 //      the block's quants per lane. Q is loaded with the same mapping.
 //   PV: warp w owns q4_0 block w of V (dims 32w..32w+31). Lane g reads the 16-bit quant pair at bytes 2g, 2g+1; n-tile
 //      0..3 column g is dim 2g, 2g+1, 16+2g, 17+2g. The output write undoes it.
+//
+// q8_0 K/V (KQ8 = true, "dq8"): the same kernel with 34-byte blocks (f16 scale + 32 int8) and 272-byte rows. The
+// permutation above is kept: S reads the 32-bit word of int8 dims 4t..4t+3 (k-step 2b) and 16+4t..16+4t+3 (k-step
+// 2b+1) of block b; PV reads the 16-bit pairs at dims 2g, 2g+1 and 16+2g, 17+2g. int8 values are biased to unsigned
+// (x ^ 0x80) and dequantized with the same 1024-exponent trick (half(1024 + u) - 1152 = x, exact). No f16 copy of
+// the KV is needed (the MMA route converts the whole context to f16: 1 GiB of scratch at 256K).
 
 #define DQ4_D       256
 #define DQ4_GQA     6
@@ -28,16 +34,22 @@
 #define DQ4_NWARPS  8
 #define DQ4_ROW     144                                     // q4_0 bytes per 256-dim row
 #define DQ4_PIECES  (DQ4_ROW / 16)                          // 9 x 16 B per row
+#define DQ8_ROW     272                                     // q8_0 bytes per 256-dim row (17 x 16 B)
 #define DQ4_MAXQ    8                                       // decode: query tokens in one launch tile (1, 2 or 4 16-row tiles)
 #define DQ4_TILE_TOK 10                                     // n_q > 8 (prefill): query tokens per row tile on grid z (60 rows)
 #define DQ4_MAXQ_ALL 512                                    // query tokens per op
 #define DQ4_KV_B    (DQ4_CHUNK * DQ4_ROW)                   // 9216 B of K (or V) per chunk
 #define DQ4_STAGE_B (2 * DQ4_KV_B + DQ4_TILE_TOK * DQ4_CHUNK * 2) // K, V, mask rows of one row tile
+
+// row bytes / KV bytes per chunk / stage bytes for q4_0 (kq8 = false) or q8_0 (kq8 = true) K and V
+static __host__ __device__ constexpr int dq_row(const bool kq8)     { return kq8 ? DQ8_ROW : DQ4_ROW; }
+static __host__ __device__ constexpr int dq_kv_b(const bool kq8)    { return DQ4_CHUNK * dq_row(kq8); }
+static __host__ __device__ constexpr int dq_stage_b(const bool kq8) { return 2 * dq_kv_b(kq8) + DQ4_TILE_TOK * DQ4_CHUNK * 2; }
 #define DQ4_SS      72                                      // S row stride (floats)
 #define DQ4_PS      72                                      // P row stride (halves)
 
-static __host__ __device__ constexpr int dq4_smem_bytes(const int m_tiles, const int nstages) {
-    return nstages * DQ4_STAGE_B + m_tiles * 16 * DQ4_SS * 4 + m_tiles * 16 * DQ4_PS * 2 + m_tiles * 16 * 4;
+static __host__ __device__ constexpr int dq4_smem_bytes(const int m_tiles, const int nstages, const bool kq8 = false) {
+    return nstages * dq_stage_b(kq8) + m_tiles * 16 * DQ4_SS * 4 + m_tiles * 16 * DQ4_PS * 2 + m_tiles * 16 * 4;
 }
 
 static __device__ __forceinline__ void dq4_mma(float * c, const uint32_t * a, const uint32_t b0, const uint32_t b1) {
@@ -75,7 +87,21 @@ static __device__ __forceinline__ uint32_t dq4_deq(const uint32_t x, const uint3
     return dq4_h2u(__hmul2(v, d));
 }
 
-template <int M_TILES, int NSTAGES>
+// q8_0: bytes in xu are int8 ^ 0x80 (unsigned 0..255) -> half(1024 + u) in the selected lanes, then (u - 128) * d
+static __device__ __forceinline__ uint32_t dq8_deq(const uint32_t xu, const uint32_t sel, const half2 d) {
+    const uint32_t u = __byte_perm(xu, 0x64646464u, sel);
+    const half2 v = __hsub2(*(const half2 *) &u, __half2half2(__float2half(1152.0f)));
+    return dq4_h2u(__hmul2(v, d));
+}
+
+// paged K/V (ggml_cuda_flash_attn_ext_decode_q4_paged); pages == nullptr: contiguous view
+struct dq4_paged {
+    const int2 * pages;
+    const char * mk;
+    const char * mv;
+};
+
+template <int M_TILES, int NSTAGES, bool KQ8>
 __launch_bounds__(DQ4_NWARPS * 32, 1)
 static __global__ void dq4_partial(
         const char * __restrict__ Q, const int64_t q_nb1, const int64_t q_nb2,
@@ -83,7 +109,7 @@ static __global__ void dq4_partial(
         const char * __restrict__ V, const int64_t v_nb1, const int64_t v_nb2,
         const char * __restrict__ mask, const int64_t mask_nb1,
         const float scale, const int nb_all, const int n_chunks, const int chunks_per_split,
-        float * __restrict__ O_part, float2 * __restrict__ ML_part) {
+        float * __restrict__ O_part, float2 * __restrict__ ML_part, const dq4_paged pg) {
 #if defined(AMPERE_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
     // row tile on grid z: query tokens [tok0, tok0 + nb); a decode (n_q <= 8) is a single tile with tok0 = 0
     const int tok0 = blockIdx.z * DQ4_TILE_TOK;
@@ -91,15 +117,25 @@ static __global__ void dq4_partial(
     Q    += tok0 * q_nb1;
     mask += tok0 * mask_nb1;
     constexpr int R   = M_TILES * 16;           // rows
-    constexpr int TPR = DQ4_NWARPS * 32 / R;    // softmax threads per row
+    // softmax threads per row: a power of two (the fixed sum order below pairs groups by powers of two). With 3
+    // m-tiles (48 rows: 6-8 query tokens without a padded 4th tile) 4 threads per row, threads 192-255 sit out.
+    constexpr int TPR = M_TILES == 3 ? 4 : DQ4_NWARPS * 32 / R;
+    constexpr int SM_THREADS = R * TPR;         // threads taking part in the softmax
     constexpr int TOK = DQ4_CHUNK / TPR;        // tokens per softmax thread
-    constexpr int WPM  = DQ4_NWARPS / M_TILES;  // S phase: warps per m-tile
+    // S phase: warps per m-tile (3 m-tiles: 2 each, the same split as 4 m-tiles; warps 6-7 sit out)
+    constexpr int WPM  = M_TILES == 3 ? 2 : DQ4_NWARPS / M_TILES;
     constexpr int TPW  = DQ4_CHUNK / WPM;       // S phase: tokens per warp
     constexpr int NT_S = TPW / 8;               // S phase: 8-token n-tiles per warp
-    static_assert(M_TILES == 1 || M_TILES == 2 || M_TILES == 4, "M_TILES");
+    static_assert(M_TILES == 1 || M_TILES == 2 || M_TILES == 3 || M_TILES == 4, "M_TILES");
+    static_assert(SM_THREADS <= DQ4_NWARPS * 32, "softmax threads");
+
+    constexpr int ROW     = dq_row(KQ8);
+    constexpr int PIECES  = ROW / 16;
+    constexpr int KV_B    = dq_kv_b(KQ8);
+    constexpr int STAGE_B = dq_stage_b(KQ8);
 
     extern __shared__ __align__(16) char dq4_smem[];
-    float * Ss      = (float *) (dq4_smem + NSTAGES * DQ4_STAGE_B);
+    float * Ss      = (float *) (dq4_smem + NSTAGES * STAGE_B);
     half  * Ps      = (half  *) (Ss + R * DQ4_SS);
     float * alpha_s = (float *) (Ps + R * DQ4_PS);
 
@@ -118,21 +154,37 @@ static __global__ void dq4_partial(
     const char * Vh = V + head * v_nb2;
 
     auto fetch = [&](const int c, const int s) {
-        char * st = dq4_smem + s * DQ4_STAGE_B;
+        char * st = dq4_smem + s * STAGE_B;
         const unsigned int st_s = ggml_cuda_cvta_generic_to_shared(st);
-        const int64_t t0 = (int64_t) c * DQ4_CHUNK;
+        int64_t t0 = (int64_t) c * DQ4_CHUNK;   // first cell of the chunk = its first mask column
+        const char * Kc;
+        const char * Vc;
+        if (pg.pages != nullptr) {
+            const int2 p = pg.pages[c];
+            t0 = p.x;
+            if (p.y >= 0) {
+                Kc = pg.mk + head * k_nb2 + (int64_t) p.y * DQ4_CHUNK * k_nb1;
+                Vc = pg.mv + head * v_nb2 + (int64_t) p.y * DQ4_CHUNK * v_nb1;
+            } else {
+                Kc = Kh + t0 * k_nb1;
+                Vc = Vh + t0 * v_nb1;
+            }
+        } else {
+            Kc = Kh + t0 * k_nb1;
+            Vc = Vh + t0 * v_nb1;
+        }
 #pragma unroll
-        for (int j = 0; j < (DQ4_CHUNK * DQ4_PIECES + DQ4_NWARPS * 32 - 1) / (DQ4_NWARPS * 32); ++j) {
+        for (int j = 0; j < (DQ4_CHUNK * PIECES + DQ4_NWARPS * 32 - 1) / (DQ4_NWARPS * 32); ++j) {
             const int i = tid + j * DQ4_NWARPS * 32;
-            if (i < DQ4_CHUNK * DQ4_PIECES) {
-                const int r = i / DQ4_PIECES, col = i % DQ4_PIECES;
-                cp_async_cg_16<0>(st_s + i * 16,            Kh + (t0 + r) * k_nb1 + col * 16);
-                cp_async_cg_16<0>(st_s + DQ4_KV_B + i * 16, Vh + (t0 + r) * v_nb1 + col * 16);
+            if (i < DQ4_CHUNK * PIECES) {
+                const int r = i / PIECES, col = i % PIECES;
+                cp_async_cg_16<0>(st_s + i * 16,        Kc + r * k_nb1 + col * 16);
+                cp_async_cg_16<0>(st_s + KV_B + i * 16, Vc + r * v_nb1 + col * 16);
             }
         }
         if (tid < nb * (DQ4_CHUNK * 2 / 16)) {
             const int q = tid / 8, col = tid % 8;
-            cp_async_cg_16<0>(st_s + 2 * DQ4_KV_B + tid * 16, mask + q * mask_nb1 + t0 * 2 + col * 16);
+            cp_async_cg_16<0>(st_s + 2 * KV_B + tid * 16, mask + q * mask_nb1 + t0 * 2 + col * 16);
         }
     };
 
@@ -194,16 +246,37 @@ static __global__ void dq4_partial(
         dq4_wait<NSTAGES - 1>();
         __syncthreads();
 
-        const char * Ksm = dq4_smem + stage * DQ4_STAGE_B;
-        const char * Vsm = Ksm + DQ4_KV_B;
-        const half * Msm = (const half *) (Ksm + 2 * DQ4_KV_B);
+        const char * Ksm = dq4_smem + stage * STAGE_B;
+        const char * Vsm = Ksm + KV_B;
+        const half * Msm = (const half *) (Ksm + 2 * KV_B);
 
-        // 2. S = Q K^T.
+        // 2. S = Q K^T (warp-uniform skip for the warps a 3-m-tile launch leaves idle)
+        if (M_TILES != 3 || s_mt < M_TILES) {
 #pragma unroll
         for (int nt = 0; nt < NT_S; ++nt) {
             const int n0 = (warp % WPM) * TPW + nt * 8;
-            const char * krow = Ksm + (n0 + g) * DQ4_ROW;
+            const char * krow = Ksm + (n0 + g) * ROW;
             float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if constexpr (KQ8) {
+#pragma unroll
+                for (int b = 0; b < DQ4_D / 32; ++b) {
+                    const half2 d2 = __half2half2(*(const half *) (krow + 34 * b));
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int off = 34 * b + 2 + 16 * h + 4 * t; // 2 mod 4 for even b, 0 mod 4 for odd b
+                        uint32_t w;
+                        if (b % 2 == 0) {
+                            const uint32_t lo = *(const uint32_t *) (krow + off - 2);
+                            const uint32_t hi = *(const uint32_t *) (krow + off + 2);
+                            w = __funnelshift_r(lo, hi, 16);
+                        } else {
+                            w = *(const uint32_t *) (krow + off);
+                        }
+                        w ^= 0x80808080u;
+                        dq4_mma(acc, Qa[2 * b + h], dq8_deq(w, 0x4140, d2), dq8_deq(w, 0x4342, d2));
+                    }
+                }
+            } else {
 #pragma unroll
             for (int b = 0; b < DQ4_D / 32; ++b) {
                 const int off = 18 * b + 2 + 4 * t;
@@ -221,6 +294,7 @@ static __global__ void dq4_partial(
                 dq4_mma(acc, Qa[2 * b + 0], dq4_deq(lo4, 0x4140, d2), dq4_deq(lo4, 0x4342, d2));
                 dq4_mma(acc, Qa[2 * b + 1], dq4_deq(hi4, 0x4140, d2), dq4_deq(hi4, 0x4342, d2));
             }
+            }
             const int n = n0 + 2 * t;
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
@@ -235,13 +309,14 @@ static __global__ void dq4_partial(
                 *(float2 *) (Ss + r * DQ4_SS + n) = v;
             }
         }
+        }
         __syncthreads();
 
         // 3. Online softmax by row. The row sum uses one fixed order for every M_TILES (batch invariance: a row's
         //    result does not depend on how many query tokens share the launch): 16 groups of 4 consecutive tokens,
         //    each summed in order, then a butterfly that pairs group G with G ^ 8, ^ 4, ^ 2, ^ 1. Thread sm_sub owns
         //    groups sm_sub + i * TPR, so the first levels are local and the rest are shuffles.
-        {
+        if (tid < SM_THREADS) { // warp-uniform: SM_THREADS is a multiple of 32
             constexpr int GPT = TOK / 4; // groups per thread
             const float * srow = Ss + sm_row * DQ4_SS;
             half * prow = Ps + sm_row * DQ4_PS;
@@ -313,6 +388,20 @@ static __global__ void dq4_partial(
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 const int tk = k0 + 2 * t + 8 * h; // tokens tk, tk + 1
+                if constexpr (KQ8) {
+                    const char * v0 = Vsm + (tk + 0) * ROW + 34 * warp;
+                    const char * v1 = Vsm + (tk + 1) * ROW + 34 * warp;
+                    const half2 d2 = __halves2half2(*(const half *) v0, *(const half *) v1);
+                    // dims 2g, 2g+1 (n-tiles 0, 1) and 16+2g, 17+2g (n-tiles 2, 3) of both tokens
+                    const uint32_t xl = ((uint32_t) *(const uint16_t *) (v0 + 2 + 2 * g) |
+                                        ((uint32_t) *(const uint16_t *) (v1 + 2 + 2 * g) << 16)) ^ 0x80808080u;
+                    const uint32_t xh = ((uint32_t) *(const uint16_t *) (v0 + 18 + 2 * g) |
+                                        ((uint32_t) *(const uint16_t *) (v1 + 18 + 2 * g) << 16)) ^ 0x80808080u;
+                    bfr[0][h] = dq8_deq(xl, 0x4240, d2);
+                    bfr[1][h] = dq8_deq(xl, 0x4341, d2);
+                    bfr[2][h] = dq8_deq(xh, 0x4240, d2);
+                    bfr[3][h] = dq8_deq(xh, 0x4341, d2);
+                } else {
                 const char * v0 = Vsm + (tk + 0) * DQ4_ROW + 18 * warp;
                 const char * v1 = Vsm + (tk + 1) * DQ4_ROW + 18 * warp;
                 const uint32_t x = (uint32_t) *(const uint16_t *) (v0 + 2 + 2 * g) |
@@ -324,6 +413,7 @@ static __global__ void dq4_partial(
                 bfr[1][h] = dq4_deq(lo4, 0x4341, d2);
                 bfr[2][h] = dq4_deq(hi4, 0x4240, d2);
                 bfr[3][h] = dq4_deq(hi4, 0x4341, d2);
+                }
             }
 #pragma unroll
             for (int mt = 0; mt < M_TILES; ++mt) {
@@ -413,7 +503,14 @@ static const char * dq4_reject_reason(int device, const ggml_tensor * dst) {
 
     float params[3];
     memcpy(params, dst->op_params, sizeof(params)); // scale, max_bias, logit_softcap
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q4_0 || V->type != GGML_TYPE_Q4_0 || dst->type != GGML_TYPE_F32) return "types";
+    // q4_0/q4_0, or q8_0/q8_0 (dq8) unless LLAMA_FA_DECODE_Q8=0
+    static const bool q8_ok = [] {
+        const char * e = getenv("LLAMA_FA_DECODE_Q8");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool kv_q4 = K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0;
+    const bool kv_q8 = q8_ok && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+    if (Q->type != GGML_TYPE_F32 || !(kv_q4 || kv_q8) || dst->type != GGML_TYPE_F32) return "types";
     if (Q->ne[0] != DQ4_D || K->ne[0] != DQ4_D || V->ne[0] != DQ4_D) return "head size";
     static const int64_t max_q = [] { // LLAMA_FA_DECODE_Q4_MAXQ: largest n_q taken (A/B of the prefill path)
         const char * e = getenv("LLAMA_FA_DECODE_Q4_MAXQ");
@@ -437,7 +534,7 @@ bool ggml_cuda_fattn_decode_q4_supported(int device, const ggml_tensor * dst) {
     }
     const char * why = dq4_reject_reason(device, dst);
     static const bool debug = getenv("LLAMA_FA_DECODE_Q4_DEBUG") != nullptr;
-    if (debug && why && dst->src[0]->ne[0] == DQ4_D && dst->src[0]->ne[1] <= 8) {
+    if (debug && why && dst->src[0]->ne[0] == DQ4_D && dst->src[0]->ne[1] <= DQ4_MAXQ_ALL) {
         const ggml_tensor * Q = dst->src[0];
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * m = dst->src[3];
@@ -449,7 +546,11 @@ bool ggml_cuda_fattn_decode_q4_supported(int device, const ggml_tensor * dst) {
     return why == nullptr;
 }
 
-template <int M_TILES, int NSTAGES>
+// set only for the duration of one ggml_cuda_flash_attn_ext_decode_q4_paged call (the CUDA backend runs a graph
+// on one host thread)
+static dq4_paged g_dq4_paged = { nullptr, nullptr, nullptr };
+
+template <int M_TILES, int NSTAGES, bool KQ8>
 static void dq4_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -462,12 +563,12 @@ static void dq4_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     memcpy(&scale, dst->op_params, sizeof(float));
 
     constexpr int R = M_TILES * 16;
-    constexpr int smem = dq4_smem_bytes(M_TILES, NSTAGES);
+    constexpr int smem = dq4_smem_bytes(M_TILES, NSTAGES, KQ8);
     static int blocks_per_sm[GGML_CUDA_MAX_DEVICES] = {0};
     if (blocks_per_sm[device] == 0) {
-        CUDA_CHECK(cudaFuncSetAttribute(dq4_partial<M_TILES, NSTAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        CUDA_CHECK(cudaFuncSetAttribute(dq4_partial<M_TILES, NSTAGES, KQ8>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         int n = 0;
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, dq4_partial<M_TILES, NSTAGES>, DQ4_NWARPS * 32, smem));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, dq4_partial<M_TILES, NSTAGES, KQ8>, DQ4_NWARPS * 32, smem));
         blocks_per_sm[device] = std::max(1, n);
     }
 
@@ -514,29 +615,96 @@ static void dq4_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool_alloc<float>  O_part(ctx.pool(), (size_t) n_splits * n_heads * n_tiles * R * DQ4_D);
     ggml_cuda_pool_alloc<float2> ML_part(ctx.pool(), (size_t) n_splits * n_heads * n_tiles * R);
 
-    dq4_partial<M_TILES, NSTAGES><<<dim3(n_splits, n_heads, n_tiles), DQ4_NWARPS * 32, smem, stream>>>(
+    dq4_partial<M_TILES, NSTAGES, KQ8><<<dim3(n_splits, n_heads, n_tiles), DQ4_NWARPS * 32, smem, stream>>>(
         (const char *) Q->data, Q->nb[1], Q->nb[2],
         (const char *) K->data, K->nb[1], K->nb[2],
         (const char *) V->data, V->nb[1], V->nb[2],
         (const char *) mask->data, mask->nb[1],
-        scale, nb, n_chunks, chunks_per_split, O_part.get(), ML_part.get());
+        scale, nb, n_chunks, chunks_per_split, O_part.get(), ML_part.get(), g_dq4_paged);
     CUDA_CHECK(cudaGetLastError());
     dq4_combine<<<dim3(nb * DQ4_GQA, n_heads), DQ4_D, 0, stream>>>(O_part.get(), ML_part.get(), n_splits, R, n_tiles,
         (char *) dst->data, dst->nb[1], dst->nb[2]);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void ggml_cuda_flash_attn_ext_decode_q4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static const int nstages = [] {
+template <bool KQ8>
+static void dq4_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    static const int nstages_env = [] {
         const char * e = getenv("LLAMA_FA_DECODE_Q4_STAGES"); // 2 or 3 (tuning)
         return e && atoi(e) == 3 ? 3 : 2;
     }();
+    // q8_0 stages are 36 KiB: 3 of them exceed the 99 KiB of shared memory per block
+    const int nstages = KQ8 ? 2 : nstages_env;
+    // opt-in LLAMA_FA_DECODE_Q4_M3=1: 3-m-tile launches for 6-8 query tokens (same per-row arithmetic)
+    static const bool m3 = [] {
+        const char * e = getenv("LLAMA_FA_DECODE_Q4_M3");
+        return e && atoi(e) != 0;
+    }();
     const int nb = (int) dst->src[0]->ne[1];
     if (nb * DQ4_GQA <= 16) {
-        if (nstages == 3) { dq4_launch<1, 3>(ctx, dst); } else { dq4_launch<1, 2>(ctx, dst); }
+        if (nstages == 3) { dq4_launch<1, 3, KQ8>(ctx, dst); } else { dq4_launch<1, 2, KQ8>(ctx, dst); }
     } else if (nb * DQ4_GQA <= 32) {
-        if (nstages == 3) { dq4_launch<2, 3>(ctx, dst); } else { dq4_launch<2, 2>(ctx, dst); }
+        if (nstages == 3) { dq4_launch<2, 3, KQ8>(ctx, dst); } else { dq4_launch<2, 2, KQ8>(ctx, dst); }
+    } else if (m3 && nb * DQ4_GQA <= 48) {
+        // 6-8 query tokens: 48 rows in 3 m-tiles instead of a padded 4th (a quarter less tensor-core work)
+        if (nstages == 3) { dq4_launch<3, 3, KQ8>(ctx, dst); } else { dq4_launch<3, 2, KQ8>(ctx, dst); }
     } else {
-        dq4_launch<4, 2>(ctx, dst);
+        dq4_launch<4, 2, KQ8>(ctx, dst);
     }
+}
+
+void ggml_cuda_flash_attn_ext_decode_q4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // Wide batches (prefill ubatches) run as consecutive chunks of 2 row tiles: the split partials are sized
+    // splits x heads x tiles x 64 rows x 256 floats, so a 128-token ubatch at 256K context would need ~430 MB of pool
+    // per call (it ran out of memory at 156K). The chunks start on row-tile boundaries, so every row is computed
+    // by the same tile, with the same arithmetic, as in one launch; the KV is read once per tile either way.
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * mask = dst->src[3];
+    constexpr int64_t chunk = 2 * DQ4_TILE_TOK;
+    if (Q->ne[1] > chunk && Q->ne[3] == 1 && dst->ne[3] == 1 && dst->ne[2] == Q->ne[1]) {
+        for (int64_t i0 = 0; i0 < Q->ne[1]; i0 += chunk) {
+            const int64_t n = std::min<int64_t>(chunk, Q->ne[1] - i0);
+            ggml_tensor q = *Q;
+            q.ne[1] = n;
+            q.data  = (char *) Q->data + i0 * Q->nb[1];
+            ggml_tensor m = *mask;
+            m.ne[1] = mask->ne[1] - i0;
+            m.data  = (char *) mask->data + i0 * mask->nb[1];
+            m.nb[2] = m.nb[1] * m.ne[1];
+            m.nb[3] = m.nb[2] * m.ne[2];
+            ggml_tensor node = *dst;
+            node.ne[2]  = n;
+            node.data   = (char *) dst->data + i0 * dst->nb[2];
+            node.nb[3]  = node.nb[2] * node.ne[2];
+            node.src[0] = &q;
+            node.src[3] = &m;
+            if (dst->src[1]->type == GGML_TYPE_Q8_0) {
+                dq4_dispatch<true>(ctx, &node);
+            } else {
+                dq4_dispatch<false>(ctx, &node);
+            }
+        }
+        return;
+    }
+    if (dst->src[1]->type == GGML_TYPE_Q8_0) {
+        dq4_dispatch<true>(ctx, dst);
+    } else {
+        dq4_dispatch<false>(ctx, dst);
+    }
+}
+
+void ggml_cuda_flash_attn_ext_decode_q4_paged(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int2 * pages,
+                                              int n_pages, const void * mirror_k, const void * mirror_v) {
+    ggml_tensor k = *dst->src[1];
+    ggml_tensor v = *dst->src[2];
+    ggml_tensor node = *dst;
+    k.ne[1] = (int64_t) n_pages * DQ4_CHUNK;
+    v.ne[1] = (int64_t) n_pages * DQ4_CHUNK;
+    k.nb[3] = k.nb[1] * k.ne[1];
+    v.nb[3] = v.nb[1] * v.ne[1];
+    node.src[1] = &k;
+    node.src[2] = &v;
+    g_dq4_paged = { pages, (const char *) mirror_k, (const char *) mirror_v };
+    ggml_cuda_flash_attn_ext_decode_q4(ctx, &node);
+    g_dq4_paged = { nullptr, nullptr, nullptr };
 }

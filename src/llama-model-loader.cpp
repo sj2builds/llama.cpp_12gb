@@ -1183,6 +1183,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             size_data -= nbytes;
             n_created++;
 
+            // an unused EXL3 weight also leaves its sign/scale vectors unused
+            if (ggml_exl3_bits(t_meta->type) > 0) {
+                for (const char * suffix : { "exl3_suh", "exl3_svh" }) {
+                    const LLM_TN_IMPL tn_aux(tn.arch, tn.tensor, suffix, tn.bid, tn.xid);
+                    const ggml_tensor * aux = get_tensor_meta(tn_aux.str().c_str());
+                    if (aux != nullptr) {
+                        size_data -= ggml_nbytes(aux);
+                        n_created++;
+                    }
+                }
+            }
+
             return nullptr;
         }
 
@@ -1385,6 +1397,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         size_data += ggml_nbytes(&t_meta);
     } else {
         n_created++;
+    }
+
+    // EXL3 weight: create its input (suh, K values) and output (svh, N values) sign/scale vectors as separate weights,
+    // named <weight base>.exl3_suh / .exl3_svh. They pick their own buffer type (a CPU override written for the weight's
+    // name does not match them), so a streamed weight keeps its vectors on the device.
+    if (!duplicated && ggml_exl3_bits(tensor->type) > 0) {
+        if (tn.suffix == nullptr || strcmp(tn.suffix, "weight") != 0 || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+            throw std::runtime_error(format("EXL3 tensor '%s' must be a 2D weight", tn.str().c_str()));
+        }
+        const LLM_TN_IMPL tn_suh(tn.arch, tn.tensor, "exl3_suh", tn.bid, tn.xid);
+        const LLM_TN_IMPL tn_svh(tn.arch, tn.tensor, "exl3_svh", tn.bid, tn.xid);
+        ggml_tensor * suh = create_tensor(hparams, buft_list_cpu, buft_list_input, buft_list_output, buft_list_layer,
+                tn_suh, { tensor->ne[0] }, 0);
+        ggml_tensor * svh = create_tensor(hparams, buft_list_cpu, buft_list_input, buft_list_output, buft_list_layer,
+                tn_svh, { tensor->ne[1] }, 0);
+        if (suh == nullptr || svh == nullptr || suh->type != GGML_TYPE_F16 || svh->type != GGML_TYPE_F16) {
+            throw std::runtime_error(format("EXL3 tensor '%s' needs F16 exl3_suh / exl3_svh vectors", tn.str().c_str()));
+        }
+        exl3_aux[tensor] = { suh, svh };
     }
 
     return tensor;

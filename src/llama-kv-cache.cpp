@@ -12,6 +12,68 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+// ---------------------------------------------------------------------------------------------
+// Stripped-model study hook (e): KV window + sinks, applied to the attention mask.
+//   LLAMA_STRIP_KV_WINDOW=<tokens>  a query at position p1 keeps only keys with p1 - p0 < window
+//   LLAMA_STRIP_KV_SINKS=<tokens>   ... plus the first `sinks` positions [0, sinks)
+// Both default to 0 = off. Emulation only: the KV is still written for every position, only the
+// attention read is limited, which is exactly what a deployment that keeps a window resident does.
+// Gated by LLAMA_STRIP_OFF as well, so a harness can run a full-attention prefix pass and a
+// windowed pass in the same process.
+// ---------------------------------------------------------------------------------------------
+// read per mask build, not as statics: a harness sets these at runtime with _putenv_s, and a DLL-load-time
+// static would only ever see the process environment (measured: the window silently stayed 0)
+static int64_t strip_kv_env_int(const char * name) {
+    const char * e = getenv(name);
+    return e != nullptr ? (int64_t) atoll(e) : (int64_t) 0;
+}
+static int64_t g_strip_kv_window() { return strip_kv_env_int("LLAMA_STRIP_KV_WINDOW"); }
+static int64_t g_strip_kv_sinks()  { return strip_kv_env_int("LLAMA_STRIP_KV_SINKS");  }
+static int64_t g_strip_kv_sample() { return strip_kv_env_int("LLAMA_STRIP_KV_SAMPLE"); }
+// LLAMA_STRIP_KV_RANGES="0:5589,20000:21000" keeps those absolute position ranges as well as the window
+// (the always-resident system/tool prefix, plus retrieved chunks). Parsed per call, because a harness changes
+// it between blocks to emulate per-block chunk retrieval.
+static std::vector<std::pair<int64_t, int64_t>> strip_kv_parse_ranges() {
+    std::vector<std::pair<int64_t, int64_t>> out;
+    const char * e = getenv("LLAMA_STRIP_KV_RANGES");
+    if (e == nullptr) {
+        return out;
+    }
+    const char * p = e;
+    while (*p != '\0') {
+        char * end = nullptr;
+        const int64_t lo = strtoll(p, &end, 10);
+        if (end == p) {
+            break;
+        }
+        p = end;
+        if (*p != ':') {
+            break;
+        }
+        ++p;
+        const int64_t hi = strtoll(p, &end, 10);
+        if (end == p) {
+            break;
+        }
+        p = end;
+        if (hi > lo) {
+            out.emplace_back(lo, hi);
+        }
+        while (*p == ',' || *p == ' ') {
+            ++p;
+        }
+    }
+    return out;
+}
+
+static bool strip_kv_on() {
+    if (g_strip_kv_window() <= 0 && getenv("LLAMA_STRIP_KV_RANGES") == nullptr) {
+        return false;
+    }
+    const char * off = getenv("LLAMA_STRIP_OFF");
+    return off == nullptr || off[0] == '\0' || off[0] == '0';
+}
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -204,11 +266,15 @@ llama_kv_cache::llama_kv_cache(
             sizes.push_back({k, v}); total += k + v;
         }
         if (total > budget) {
-            // Include both staging slots in the budget, retaining at least two
-            // resident layers when the model has enough attention layers.
-            const uint32_t maximum = cache_layers > 3 ? cache_layers - 2 : cache_layers;
+            // Include both staging slots in the budget. By default at least one layer stays resident (the two
+            // staging slots are the rest); LLAMA_KV_BUDGET_MIN_RESIDENT=0 allows a fully staged F context, which the
+            // two-level KV scratch design wants because F then runs rarely (reviewer seq 144 item 4).
+            const char * minres_env = getenv("LLAMA_KV_BUDGET_MIN_RESIDENT");
+            const uint32_t min_resident = (minres_env && minres_env[0]) ? (uint32_t) std::max(0, atoi(minres_env)) : 1u;
+            const uint32_t maximum = min_resident == 0 ? cache_layers
+                                 : (cache_layers > 3 ? cache_layers - 2 : cache_layers);
             bool found = false;
-            for (uint32_t count = 1; count <= maximum; ++count) {
+            for (uint32_t count = min_resident; count <= maximum; ++count) {
                 size_t resident = 0, max_k = 0, max_v = 0;
                 for (uint32_t i = 0; i < cache_layers; ++i) {
                     if ((i + 1) * count / cache_layers != i * count / cache_layers) {
@@ -226,7 +292,14 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_INFO("staged KV: automatic placement for %llu MiB GPU KV budget (includes staging, excludes weights/workspace/MTP)\n",
                        (unsigned long long) mib);
     }
-    if (staged_layers && (!offload || v_trans || n_stream != 1 || n_seq_max != 1 || is_mla || n_swa || reuse || share || other)) {
+    const bool stage_incompatible = !offload || v_trans || n_stream != 1 || n_seq_max != 1 || is_mla || n_swa || reuse || share || other;
+    if (staged_layers && stage_incompatible && staged_requested && !(budget_env && budget_env[0])) {
+        // LLAMA_KV_STAGED_LAYERS is process-wide: it also reaches the drafter's (SWA) cache, which cannot be staged.
+        // Keep such caches resident instead of failing (an explicit budget below still errors as before).
+        LLAMA_LOG_INFO("staged KV: LLAMA_KV_STAGED_LAYERS ignored for an incompatible cache (SWA/MLA/shared/multi-seq)\n");
+        staged_layers = 0;
+    }
+    if (staged_layers && stage_incompatible) {
         throw std::runtime_error("staged KV requires GPU offload, flash attention, -np 1, and a non-SWA/non-MLA cache without cross-layer sharing");
     }
     if (staged_layers) {
@@ -1390,6 +1463,182 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+bool llama_kv_cache::copy_scratch_from(const llama_kv_cache & src, llama_seq_id seq_id,
+        const std::vector<std::pair<llama_pos, llama_pos>> & ranges) {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() ||
+            (size_t) seq_id >= src.seq_to_stream.size() || v_trans || src.v_trans ||
+            type_k() != src.type_k() || type_v() != src.type_v() ||
+            layers.size() != src.layers.size() || &model != &src.model) {
+        return false;
+    }
+
+    struct selected_cell {
+        llama_pos pos;
+        uint32_t src;
+        uint32_t dst;
+    };
+    std::vector<selected_cell> selected;
+    const auto & src_cells = src.v_cells[src.seq_to_stream[seq_id]];
+    for (const auto & [pos, cell] : src_cells.seq_pos_get(seq_id)) {
+        bool keep = false;
+        for (const auto & range : ranges) {
+            if (pos >= range.first && pos < range.second) {
+                keep = true;
+                break;
+            }
+        }
+        if (keep) {
+            selected.push_back({ pos, cell, (uint32_t) selected.size() });
+        }
+    }
+
+    auto & dst_cells = v_cells[seq_to_stream[seq_id]];
+    if (selected.size() > dst_cells.size()) {
+        return false;
+    }
+    clear(false);
+    for (const auto & cell : selected) {
+        dst_cells.pos_set(cell.dst, cell.pos);
+        dst_cells.ext_set(cell.dst, src_cells.ext_get(cell.src));
+        dst_cells.seq_add(cell.dst, seq_id);
+    }
+
+    struct run { uint32_t src; uint32_t dst; uint32_t n; };
+    std::vector<run> runs;
+    for (const auto & cell : selected) {
+        if (!runs.empty() && runs.back().src + runs.back().n == cell.src &&
+                runs.back().dst + runs.back().n == cell.dst) {
+            ++runs.back().n;
+        } else {
+            runs.push_back({ cell.src, cell.dst, 1 });
+        }
+    }
+
+    std::vector<std::array<uint32_t, 3>> runs3;
+    runs3.reserve(runs.size());
+    for (const auto & r : runs) {
+        runs3.push_back({ r.src, r.dst, r.n });
+    }
+    return copy_scratch_rows(src, runs3);
+}
+
+// KV-scratch: copy K/V rows (src cell -> dst cell, n consecutive cells) for every attention layer. All runs of a
+// layer are gathered into one host buffer per tensor, so a layer costs one read and one write per run instead of
+// a fresh allocation per run.
+bool llama_kv_cache::copy_scratch_rows(const llama_kv_cache & src, const std::vector<std::array<uint32_t, 3>> & runs) {
+    if (runs.empty()) {
+        return true;
+    }
+    size_t total = 0;
+    for (const auto & r : runs) {
+        total += r[2];
+    }
+    std::vector<uint8_t> tmp_k;
+    std::vector<uint8_t> tmp_v;
+    for (const auto & dst_layer : layers) {
+        const auto it = src.map_layer_ids.find((int32_t) dst_layer.il);
+        if (it == src.map_layer_ids.end()) return false;
+        const auto & src_layer = src.layers[it->second];
+        if (!dst_layer.k || !dst_layer.v || !src_layer.k || !src_layer.v ||
+                dst_layer.k->type != src_layer.k->type || dst_layer.v->type != src_layer.v->type ||
+                dst_layer.k->nb[1] != src_layer.k->nb[1] || dst_layer.v->nb[1] != src_layer.v->nb[1]) {
+            return false;
+        }
+        const size_t k_row = dst_layer.k->nb[1];
+        const size_t v_row = dst_layer.v->nb[1];
+        tmp_k.resize(total * k_row);
+        tmp_v.resize(total * v_row);
+        size_t off = 0;
+        for (const auto & r : runs) {
+            ggml_backend_tensor_get(src_layer.k, tmp_k.data() + off * k_row, (size_t) r[0] * k_row, (size_t) r[2] * k_row);
+            ggml_backend_tensor_get(src_layer.v, tmp_v.data() + off * v_row, (size_t) r[0] * v_row, (size_t) r[2] * v_row);
+            off += r[2];
+        }
+        off = 0;
+        for (const auto & r : runs) {
+            ggml_backend_tensor_set(dst_layer.k, tmp_k.data() + off * k_row, (size_t) r[1] * k_row, (size_t) r[2] * k_row);
+            ggml_backend_tensor_set(dst_layer.v, tmp_v.data() + off * v_row, (size_t) r[1] * v_row, (size_t) r[2] * v_row);
+            off += r[2];
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::update_scratch_from(const llama_kv_cache & src, llama_seq_id seq_id,
+        const std::vector<std::pair<llama_pos, llama_pos>> & ranges, llama_pos invalidate_from) {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() ||
+            (size_t) seq_id >= src.seq_to_stream.size() || v_trans || src.v_trans ||
+            type_k() != src.type_k() || type_v() != src.type_v() ||
+            layers.size() != src.layers.size() || &model != &src.model) {
+        return false;
+    }
+    // position bitmap, so the per-cell test is O(1) (hundreds of page ranges x tens of thousands of cells)
+    llama_pos want_end = 0;
+    for (const auto & r : ranges) {
+        want_end = std::max(want_end, r.second);
+    }
+    std::vector<uint8_t> want((size_t) std::max<llama_pos>(want_end, 0), 0);
+    for (const auto & r : ranges) {
+        for (llama_pos p = std::max<llama_pos>(r.first, 0); p < r.second; ++p) {
+            want[(size_t) p] = 1;
+        }
+    }
+    auto wanted = [&](llama_pos p) {
+        return p >= 0 && (size_t) p < want.size() && want[(size_t) p] != 0;
+    };
+
+    const uint32_t strm = seq_to_stream[seq_id];
+    auto & dst_cells = v_cells[strm];
+    const auto & src_cells = src.v_cells[src.seq_to_stream[seq_id]];
+
+    // 1. drop the cells that are no longer wanted, and every cell at or after invalidate_from (D wrote those
+    //    itself during the previous cycle; F's values replace them)
+    std::vector<uint8_t> present;
+    for (uint32_t i = 0; i < dst_cells.size(); ++i) {
+        if (dst_cells.is_empty(i)) {
+            continue;
+        }
+        const llama_pos p = dst_cells.pos_get(i);
+        if (!dst_cells.seq_has(i, seq_id) || p >= invalidate_from || !wanted(p)) {
+            dst_cells.rm(i);
+            continue;
+        }
+        if ((size_t) p >= present.size()) {
+            present.resize((size_t) p + 1, 0);
+        }
+        present[(size_t) p] = 1;
+    }
+
+    // 2. copy the wanted positions the destination does not hold yet, into free cells (lowest index first)
+    std::vector<std::array<uint32_t, 3>> runs;
+    uint32_t next_free = 0;
+    for (const auto & [pos, cell] : src_cells.seq_pos_get(seq_id)) {
+        if (!wanted(pos)) {
+            continue;
+        }
+        if ((size_t) pos < present.size() && present[(size_t) pos]) {
+            continue;
+        }
+        while (next_free < dst_cells.size() && !dst_cells.is_empty(next_free)) {
+            ++next_free;
+        }
+        if (next_free >= dst_cells.size()) {
+            return false;
+        }
+        dst_cells.pos_set(next_free, pos);
+        dst_cells.ext_set(next_free, src_cells.ext_get(cell));
+        dst_cells.seq_add(next_free, seq_id);
+        if (!runs.empty() && runs.back()[0] + runs.back()[2] == cell && runs.back()[1] + runs.back()[2] == next_free) {
+            ++runs.back()[2];
+        } else {
+            runs.push_back({ cell, next_free, 1 });
+        }
+        ++next_free;
+    }
+    v_heads[strm] = 0;
+    return copy_scratch_rows(src, runs);
+}
+
 uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -1683,6 +1932,9 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    // R2-5g item 1: when non-null, these ranges are used instead of LLAMA_STRIP_KV_RANGES (per-layer mask fill)
+    const std::vector<std::pair<int64_t, int64_t>> * ranges = nullptr;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1702,6 +1954,28 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
+
+    const bool kv_win = strip_kv_on();
+    const int64_t kv_window = g_strip_kv_window();
+    const int64_t kv_sinks  = g_strip_kv_sinks();
+    const int64_t kv_sample = g_strip_kv_sample();
+    const auto kv_ranges = args.ranges != nullptr ? *args.ranges :
+                           (kv_win ? strip_kv_parse_ranges() : std::vector<std::pair<int64_t, int64_t>>{});
+    // KV-scratch: with hundreds of page ranges the linear scan per (query, cell) dominates the mask build, so
+    // test membership through a position bitmap instead (same keep set, O(1) per cell)
+    std::vector<uint8_t> kv_rbits;
+    if (kv_ranges.size() > 8) {
+        int64_t end = 0;
+        for (const auto & r : kv_ranges) {
+            end = std::max(end, r.second);
+        }
+        kv_rbits.assign((size_t) std::max<int64_t>(end, 0), 0);
+        for (const auto & r : kv_ranges) {
+            for (int64_t p = std::max<int64_t>(r.first, 0); p < r.second; ++p) {
+                kv_rbits[(size_t) p] = 1;
+            }
+        }
+    }
 
     // the min position in the batch for each sequence
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
@@ -1744,7 +2018,10 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
             auto & idxs = seq_idxs[seq_id];
 
-            if (!alibi) {
+            // the row-reuse shortcut is only valid when the keep pattern does not depend on p1
+            const bool reuse = !alibi && !kv_win;
+
+            if (reuse) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
 
@@ -1765,7 +2042,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 uint32_t j = jj;
 
                 // we have an exiting mask for this sequence -> update just seq_idxs
-                if (!alibi) {
+                if (reuse) {
                     if (prev) {
                         if (jj >= idxs.size()) {
                             break;
@@ -1786,7 +2063,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 p0 = cells.pos_get(j);
 
-                if (!alibi) {
+                if (reuse) {
                     if (!prev) {
                         // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
                         if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
@@ -1822,10 +2099,31 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     }
                 }
 
+                // study hook (e): keep a sliding window, the sink positions, and any configured ranges
+                float add = 0.0f;
+                if (kv_win) {
+                    bool keep = (p1 - p0) < kv_window || p0 < kv_sinks;
+                    if (!keep && !kv_rbits.empty()) {
+                        keep = p0 >= 0 && (size_t) p0 < kv_rbits.size() && kv_rbits[(size_t) p0] != 0;
+                    }
+                    for (size_t r = 0; !keep && kv_rbits.empty() && r < kv_ranges.size(); ++r) {
+                        keep = p0 >= kv_ranges[r].first && p0 < kv_ranges[r].second;
+                    }
+                    if (!keep && kv_sample > 1 && (p0 % kv_sample) == 0) {
+                        // probe A: a sampled far key stands in for its k neighbours, so its softmax weight is
+                        // multiplied by k -> an additive mask of +log(k)
+                        keep = true;
+                        add = logf((float) kv_sample);
+                    }
+                    if (!keep) {
+                        goto skip;
+                    }
+                }
+
                 if (alibi) {
                     data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
                 } else {
-                    data[idst + j] = mask_keep;
+                    data[idst + j] = llama_cast<T>(add);
                 }
 
                 continue;
@@ -1875,6 +2173,88 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+
+// R2-5g item 1: per-layer KQ mask. Opt-in via LLAMA_STRIP_KV_RANGES_L=<file> (one line per KV layer, index = kv
+// layer index in llama_kv_cache::get_layer_ids() order, same "lo:hi,lo:hi" syntax as LLAMA_STRIP_KV_RANGES; an
+// empty line means "window only"). Emulation only: the cache still stores every position, only the attention read
+// differs per layer. With the variable unset nothing here is called and the shared single-plane mask is unchanged.
+static std::vector<std::vector<std::pair<int64_t, int64_t>>> strip_kv_parse_ranges_layered(int n_layers) {
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> out((size_t) n_layers);
+    const char * path = getenv("LLAMA_STRIP_KV_RANGES_L");
+    if (path == nullptr || path[0] == '\0') {
+        return out;
+    }
+    FILE * f = fopen(path, "rb");
+    if (f == nullptr) {
+        LLAMA_LOG_ERROR("%s: cannot open %s\n", __func__, path);
+        return out;
+    }
+    char line[4096];
+    int il = 0;
+    while (il < n_layers && fgets(line, sizeof(line), f) != nullptr) {
+        const char * p = line;
+        while (*p != '\0') {
+            char * pend = nullptr;
+            const int64_t lo = strtoll(p, &pend, 10);
+            if (pend == p) {
+                break;
+            }
+            p = pend;
+            if (*p != ':') {
+                break;
+            }
+            ++p;
+            const int64_t hi = strtoll(p, &pend, 10);
+            if (pend == p) {
+                break;
+            }
+            p = pend;
+            if (hi > lo) {
+                out[(size_t) il].emplace_back(lo, hi);
+            }
+            while (*p == ',' || *p == ' ') {
+                ++p;
+            }
+        }
+        ++il;
+    }
+    fclose(f);
+    return out;
+}
+
+void llama_kv_cache::set_input_kq_mask_layered(ggml_tensor * dst, const llama_ubatch * ubatch,
+                                              bool causal_attn) const {
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_layers = dst->ne[2];
+    const int64_t n_stream = dst->ne[3];
+
+    GGML_ASSERT(n_stream == 1 && "per-layer KQ mask requires a single stream");
+    GGML_ASSERT(n_tokens * n_layers * n_kv <= ggml_nelements(dst));
+
+    const auto ranges = strip_kv_parse_ranges_layered((int) n_layers);
+
+    for (int64_t l = 0; l < n_layers; ++l) {
+        const args_set_input_kq_mask args = {
+            /*.hparams          =*/ hparams,
+            /*.ubatch           =*/ ubatch,
+            /*.v_cells          =*/ v_cells,
+            /*.seq_to_stream    =*/ seq_to_stream,
+            /*.n_swa            =*/ n_swa,
+            /*.swa_type         =*/ swa_type,
+            /*.n_kv             =*/ n_kv,
+            /*.n_stream         =*/ 1,
+            /*.n_tps            =*/ n_tokens,
+            /*.ranges           =*/ &ranges[(size_t) l],
+        };
+        if (dst->type == GGML_TYPE_F16) {
+            set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data + l * n_kv * n_tokens, causal_attn);
+        } else {
+            set_input_kq_mask_impl<float>(args, (float *) dst->data + l * n_kv * n_tokens, causal_attn);
+        }
+    }
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
@@ -1920,6 +2300,175 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         LLAMA_LOG_ERROR("%s: kq mask %0.3f ms n_kv=%lld n_tok=%lld\n", __func__,
                 (t_end - t_start)/1000.0, (long long) n_kv, (long long) n_tokens);
     }
+
+    export_stage_cells(ubatch, n_kv);
+    export_hot_cells();
+}
+
+// KV-scratch hot rows (opt-in LLAMA_KV_HOT_RANGES): the CUDA staged-KV path mirrors the cells of these position
+// ranges in VRAM. Only positions below LLAMA_KV_HOT_COMMIT are published: committed rows are never rewritten, so a
+// device copy of them stays exact. The ranges keep their order (the caller lists them by priority; the mirror
+// takes pages in this order until it is full). Cached per cache instance: committed cells do not move.
+void llama_kv_cache::export_hot_cells() const {
+#ifdef _WIN32
+    auto put = [](const std::string & v) { _putenv_s("LLAMA_KV_HOT_CELLS", v.c_str()); };
+#else
+    auto put = [](const std::string & v) { setenv("LLAMA_KV_HOT_CELLS", v.c_str(), 1); };
+#endif
+    const char * ranges_env = getenv("LLAMA_KV_HOT_RANGES");
+    if (ranges_env == nullptr || ranges_env[0] == '\0' || n_stream != 1) {
+        const char * cur = getenv("LLAMA_KV_HOT_CELLS");
+        if (cur != nullptr && cur[0] != '\0') {
+            put("");
+        }
+        return;
+    }
+    const char * commit_env = getenv("LLAMA_KV_HOT_COMMIT");
+    const int64_t commit = commit_env != nullptr ? (int64_t) atoll(commit_env) : 0;
+    const std::string key = std::string(ranges_env) + "|" + std::to_string(commit);
+    if (key != hot_cells_key) {
+        hot_cells_key = key;
+        hot_cells_value.clear();
+        // committed position -> cell
+        const auto & cells = v_cells[0];
+        std::vector<int32_t> cell_of_pos((size_t) std::max<int64_t>(commit, 0), -1);
+        for (uint32_t j = 0; j < cells.size(); ++j) {
+            if (cells.is_empty(j)) {
+                continue;
+            }
+            const llama_pos p = cells.pos_get(j);
+            if (p >= 0 && (int64_t) p < commit) {
+                cell_of_pos[(size_t) p] = (int32_t) j;
+            }
+        }
+        const char * p = ranges_env;
+        while (*p != '\0') {
+            char * end = nullptr;
+            const int64_t lo = strtoll(p, &end, 10);
+            if (end == p || *end != ':') {
+                break;
+            }
+            p = end + 1;
+            const int64_t hi = strtoll(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            p = end;
+            while (*p == ',' || *p == ' ') {
+                ++p;
+            }
+            // consecutive positions in consecutive cells form one run
+            int64_t run_lo = -1, run_hi = -1;
+            auto flush = [&]() {
+                if (run_lo >= 0) {
+                    if (!hot_cells_value.empty()) {
+                        hot_cells_value += ',';
+                    }
+                    hot_cells_value += std::to_string(run_lo) + ':' + std::to_string(run_hi);
+                }
+                run_lo = run_hi = -1;
+            };
+            for (int64_t pos = std::max<int64_t>(lo, 0); pos < std::min(hi, commit); ++pos) {
+                const int32_t c = cell_of_pos[(size_t) pos];
+                if (c < 0) {
+                    flush();
+                    continue;
+                }
+                if (run_lo >= 0 && c == run_hi) {
+                    ++run_hi;
+                } else {
+                    flush();
+                    run_lo = c;
+                    run_hi = c + 1;
+                }
+            }
+            flush();
+        }
+    }
+    put(hot_cells_value);
+}
+
+// KV-scratch single-context mode (opt-in LLAMA_KV_RANGE_STAGING=1): when the strip mask is on, tell the CUDA
+// staged-KV path which cells this ubatch can see at all, so it copies only those rows of each staged layer into
+// its slot (the masked rows are never read through a non-zero weight). Passed as LLAMA_KV_STAGE_CELLS =
+// "lo:hi,..." cell-index runs; empty = stage the full prefix as usual. Read per eval by staged-kv.cuh.
+void llama_kv_cache::export_stage_cells(const llama_ubatch * ubatch, int64_t n_kv) const {
+    const char * enable = getenv("LLAMA_KV_RANGE_STAGING");
+    if (enable == nullptr || enable[0] == '\0' || strcmp(enable, "0") == 0) {
+        return;
+    }
+#ifdef _WIN32
+    auto put = [](const std::string & v) { _putenv_s("LLAMA_KV_STAGE_CELLS", v.c_str()); };
+#else
+    auto put = [](const std::string & v) { setenv("LLAMA_KV_STAGE_CELLS", v.c_str(), 1); };
+#endif
+    if (!strip_kv_on() || ubatch->n_tokens == 0 || n_stream != 1) {
+        put("");
+        return;
+    }
+    const int64_t kv_window = g_strip_kv_window();
+    const int64_t kv_sinks  = g_strip_kv_sinks();
+    const auto kv_ranges = strip_kv_parse_ranges();
+    llama_pos q_min = INT32_MAX;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        q_min = std::min(q_min, ubatch->pos[i]);
+    }
+    std::vector<uint8_t> rbits;
+    {
+        int64_t end = 0;
+        for (const auto & r : kv_ranges) {
+            end = std::max(end, r.second);
+        }
+        rbits.assign((size_t) std::max<int64_t>(end, 0), 0);
+        for (const auto & r : kv_ranges) {
+            for (int64_t p = std::max<int64_t>(r.first, 0); p < r.second; ++p) {
+                rbits[(size_t) p] = 1;
+            }
+        }
+    }
+    const auto & cells = v_cells[0];
+    const int64_t n = std::min<int64_t>(n_kv, cells.size());
+    std::string out;
+    int64_t run_lo = -1;
+    auto flush = [&](int64_t hi) {
+        if (run_lo >= 0) {
+            if (!out.empty()) {
+                out += ',';
+            }
+            out += std::to_string(run_lo) + ':' + std::to_string(hi);
+            run_lo = -1;
+        }
+    };
+    for (int64_t j = 0; j < n; ++j) {
+        bool keep = false;
+        if (!cells.is_empty((uint32_t) j)) {
+            const llama_pos p0 = cells.pos_get((uint32_t) j);
+            // union over the ubatch's queries of the window rule (p1 - p0) < window, plus sinks, plus ranges
+            keep = (kv_window > 0 && (int64_t) p0 > (int64_t) q_min - kv_window) || p0 < kv_sinks ||
+                   p0 >= q_min ||
+                   (p0 >= 0 && (size_t) p0 < rbits.size() && rbits[(size_t) p0] != 0);
+        }
+        if (keep && run_lo < 0) {
+            run_lo = j;
+        } else if (!keep) {
+            flush(j);
+        }
+    }
+    flush(n);
+    put(out.empty() ? std::string("0:0") : out);
+}
+
+bool llama_kv_cache_context::kv_layers_supported(int64_t n_stream) {
+    const char * path = getenv("LLAMA_STRIP_KV_RANGES_L");
+    return path != nullptr && path[0] != '\0' && n_stream == 1;
+}
+
+int32_t llama_kv_cache_context::get_n_layers_kv() const {
+    return (int32_t) kv->get_layer_ids().size();
+}
+
+std::vector<uint32_t> llama_kv_cache_context::get_layer_ids_kv() const {
+    return kv->get_layer_ids();
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -3157,6 +3706,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_mask_layered(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    kv->set_input_kq_mask_layered(dst, ubatch, causal_attn);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

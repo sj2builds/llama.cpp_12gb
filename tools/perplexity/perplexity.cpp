@@ -183,6 +183,9 @@ struct kl_divergence_result {
     double sum_p_diff       = 0.0;
     double sum_p_diff2      = 0.0;
     double sum_p_diff4      = 0.0;
+    // sampling acceptance against the base model: sum_i min(p_i, q_i) = 1 - TV(p, q)
+    double sum_accept  = 0.0;
+    double sum_accept2 = 0.0;
     float  max_p_diff       = 0.0f;
     size_t n_same_top       = 0.0;
     size_t count            = 0.0;
@@ -234,7 +237,26 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
     }
     kld.sum_kld  += sum;
     kld.sum_kld2 += sum*sum;
-    ++kld.count;
+
+    // Sampling acceptance: sum_i min(p_i, q_i) = 1 - TV(p, q), i.e. the probability that a token drawn from
+    // this model is accepted by a rejection sampler that uses the base distribution. Unlike the KLD sum above
+    // every term is non-negative, so the tail cannot be skipped by a relative threshold; entries with
+    // p_base <= exp(-26) contribute less than 5e-12 each, i.e. under 1e-6 over the whole vocabulary.
+    {
+        double sum_min = 0.0;
+        for (int i = 0; i < n_vocab; ++i) {
+            const float p_log_base = scale*base_log_prob[i] + min_log_prob;
+            if (p_log_base <= -26.f) {
+                continue;
+            }
+            const float q = expf(p_log_base);
+            const float p = expf(logits[i] - max_logit);
+            sum_min += (p < q) ? p : q;
+        }
+        kld.sum_accept  += sum_min;
+        kld.sum_accept2 += sum_min*sum_min;
+    }
+++kld.count;
     if (imax == imax_base) {
         ++kld.n_same_top;
     }
@@ -273,6 +295,8 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 kld.sum_p_diff       += local_kld.sum_p_diff;
                 kld.sum_p_diff2      += local_kld.sum_p_diff2;
                 kld.sum_p_diff4      += local_kld.sum_p_diff4;
+                kld.sum_accept  += local_kld.sum_accept;
+                kld.sum_accept2 += local_kld.sum_accept2;
                 kld.n_same_top       += local_kld.n_same_top;
                 kld.max_p_diff        = std::max(kld.max_p_diff, local_kld.max_p_diff);
                 kld.count            += local_kld.count;
@@ -649,6 +673,30 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         LOG_ERR("Unexpected negative standard deviation of log(prob)\n");
     }
 
+
+    // opt-in (R5-1 / int8 re-gate): per-token NLL for a paired analysis. LLAMA_PPL_NLL_DUMP=<file> writes
+    // {int32 n_chunks, int32 n_ctx, int32 n_per_chunk} then, per chunk, the -log p of the actual next token for
+    // positions first..n_ctx-2 (n_per_chunk values); prob_history holds the probability of the scored token.
+    if (const char * nll_path = getenv("LLAMA_PPL_NLL_DUMP")) {
+        if (nll_path[0] != 0) {
+            FILE * fn = fopen(nll_path, "wb");
+            if (fn != nullptr) {
+                const int32_t hdr[3] = { (int32_t) n_chunk, (int32_t) n_ctx, (int32_t) (n_ctx - 1 - first) };
+                fwrite(hdr, sizeof(int32_t), 3, fn);
+                std::vector<float> row((size_t) (n_ctx - 1 - first));
+                for (int i = 0; i < n_chunk; ++i) {
+                    for (int j = 0; j < n_ctx - 1 - first; ++j) {
+                        const float pb = prob_history[(size_t) (i*n_ctx + first + j)];
+                        row[(size_t) j] = pb > 0.0f ? -logf(pb) : 999.0f;
+                    }
+                    fwrite(row.data(), sizeof(float), row.size(), fn);
+                }
+                fclose(fn);
+                LOG_INF("%s: wrote per-token NLL to %s (%d chunks x %d tokens)\n", __func__, nll_path, n_chunk,
+                        n_ctx - 1 - first);
+            }
+        }
+    }
 
     return {tokens, ppl, logit_history, prob_history};
 }
@@ -1980,6 +2028,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     const double same_top_p = 1.0*kld.n_same_top/kld.count;
     LOG("Same top p: %6.3lf ± %5.3lf %%\n", 100.0*same_top_p, 100.0*sqrt(same_top_p*(1.0 - same_top_p)/(kld.count - 1)));
+
+    // sampling acceptance: 1 - total variation distance to the base distribution
+    auto accept = mean_and_uncertainty(kld.sum_accept, kld.sum_accept2, kld.count);
+    LOG("Mean accept (1-TV): %10.6lf ± %10.6lf\n", accept.first, accept.second);
 }
 
 // satisfies -Wmissing-declarations

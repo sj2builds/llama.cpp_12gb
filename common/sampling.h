@@ -46,8 +46,10 @@ void common_sampler_free(struct common_sampler * gsmpl);
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
-struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
-void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
+// with_candidates = false skips the (n_vocab-sized) candidate buffer: the copy is only valid for a
+// restore followed by a fresh set_logits, as in the server's checkpoint rollback.
+struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl, bool with_candidates = true);
+void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst, bool with_candidates = true);
 
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);

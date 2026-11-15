@@ -26,6 +26,9 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-decode-q4.cuh"
+#include "ggml-cuda/fakeq.cuh"
+#include "ggml-cuda/exl3.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -64,6 +67,8 @@
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
+#include "ggml-cuda/hot.cuh"
+#include "ggml-cuda/strip.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
@@ -87,6 +92,7 @@
 #include <memory>
 #include <mutex>
 #include <cstdarg>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -105,6 +111,11 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
+    if (id >= 0 && ggml_cuda_mem_trace_enabled()) {
+        // The failed call left a sticky error; clear it so cudaMemGetInfo works, then report state.
+        (void) cudaGetLastError();
+        ggml_cuda_mem_trace_dump(id, "cuda_error");
+    }
     // abort with GGML_ABORT to get a stack trace
     GGML_ABORT(GGML_CUDA_NAME " error");
 }
@@ -465,11 +476,971 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// ---------------------------------------------------------------------------------------------
+// Opt-in CUDA memory tracing: LLAMA_CUDA_MEM_TRACE=1.
+//
+// Logs, on stderr: every pool creation and (optionally filtered) pool allocation with the node
+// that requested it, every cuBLAS handle creation, and a per-eval dump of cudaMemGetInfo plus
+// each live pool's cached and peak bytes. Off by default: all helpers below return immediately
+// after one load of a static bool, and the default path allocates and frees exactly as before.
+//   LLAMA_CUDA_MEM_TRACE_MIN_MIB=N   only log allocations >= N MiB (default 0 = all)
+//   LLAMA_CUDA_MEM_TRACE_EVERY=N     only dump the per-eval state every N-th eval (default 1)
+// ---------------------------------------------------------------------------------------------
+
+// Node whose kernel is currently being launched, so an allocation can be attributed to it.
+static const char * g_mem_trace_node = "";
+
+bool ggml_cuda_mem_trace_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_CUDA_MEM_TRACE");
+        return e != nullptr && e[0] != 0 && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static size_t ggml_cuda_mem_trace_min_bytes() {
+    static const size_t v = [] {
+        const char * e = getenv("LLAMA_CUDA_MEM_TRACE_MIN_MIB");
+        const double mib = e != nullptr ? atof(e) : 0.0;
+        return (size_t) (mib * 1048576.0);
+    }();
+    return v;
+}
+
+static int ggml_cuda_mem_trace_every() {
+    static const int v = [] {
+        const char * e = getenv("LLAMA_CUDA_MEM_TRACE_EVERY");
+        const int n = e != nullptr ? atoi(e) : 1;
+        return n > 0 ? n : 1;
+    }();
+    return v;
+}
+
+size_t ggml_cuda_mem_trace_free(int device) {
+    if (!ggml_cuda_mem_trace_enabled()) {
+        return 0;
+    }
+    ggml_cuda_set_device(device);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    return free_b;
+}
+
+void ggml_cuda_mem_trace_line(const char * fmt, ...) {
+    if (!ggml_cuda_mem_trace_enabled()) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "MEMTRACE ");
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+    fflush(stderr);
+}
+
+// Registry of live pools, so an allocation failure in one pool can report what every other pool
+// still holds (the legacy pool only ever flushes its own cached buffers). Tracing only.
+struct ggml_cuda_mem_trace_pool_entry {
+    ggml_cuda_pool * pool;
+    int device;
+    int stream_no;
+};
+static std::mutex g_mem_trace_pools_mutex;
+static std::vector<ggml_cuda_mem_trace_pool_entry> g_mem_trace_pools;
+
+static void ggml_cuda_mem_trace_register_pool(ggml_cuda_pool * pool, int device, int stream_no) {
+    if (!ggml_cuda_mem_trace_enabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_mem_trace_pools_mutex);
+    g_mem_trace_pools.push_back({ pool, device, stream_no });
+}
+
+static void ggml_cuda_mem_trace_unregister_pool(ggml_cuda_pool * pool) {
+    if (!ggml_cuda_mem_trace_enabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_mem_trace_pools_mutex);
+    for (auto it = g_mem_trace_pools.begin(); it != g_mem_trace_pools.end(); ++it) {
+        if (it->pool == pool) {
+            g_mem_trace_pools.erase(it);
+            break;
+        }
+    }
+}
+
+void ggml_cuda_mem_trace_dump(int device, const char * tag) {
+    if (!ggml_cuda_mem_trace_enabled()) {
+        return;
+    }
+    static int64_t n_calls = 0;
+    if ((n_calls++ % ggml_cuda_mem_trace_every()) != 0) {
+        return;
+    }
+
+    ggml_cuda_set_device(device);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    size_t cached = 0, peak = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mem_trace_pools_mutex);
+        for (const auto & e : g_mem_trace_pools) {
+            if (e.device != device) {
+                continue;
+            }
+            size_t c = 0, p = 0;
+            e.pool->stats(c, p);
+            cached += c;
+            peak   += p;
+            ggml_cuda_mem_trace_line("%s dev=%d free=%.2f/%.2f MiB pool[stream=%d] cached=%.2f peak=%.2f MiB",
+                                     tag, device, (double) free_b / 1048576.0, (double) total_b / 1048576.0,
+                                     e.stream_no, (double) c / 1048576.0, (double) p / 1048576.0);
+        }
+    }
+    ggml_cuda_mem_trace_line("%s dev=%d free=%.2f/%.2f MiB all_pools cached=%.2f peak=%.2f MiB",
+                             tag, device, (double) free_b / 1048576.0, (double) total_b / 1048576.0,
+                             (double) cached / 1048576.0, (double) peak / 1048576.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Emulation-only hotness probe (hot-KV scratch study, reviewer seq 131/133). Gated by
+// LLAMA_HOT_TRACE=<dir>: at every FLASH_ATTN_EXT node it computes the block's attention mass per key
+// position for that layer, and at eval end dumps [n_layers][n_kv] floats to <dir>/block_<LLAMA_HOT_BLOCK>.bin.
+// Default path: one env lookup, no launch, no allocation.
+//
+// R2-5c adds the sentinel probe (LLAMA_SENT_BLOCK=<tag>): four planes per (layer, head, query) - gap, argmax
+// key, out-of-scratch mass, output delta - plus an optional per-page out-of-scratch mass plane
+// (LLAMA_SENT_PAGES=<page tokens>), written to <dir>/sent_<tag>.bin behind a self-describing ASCII header.
+// ---------------------------------------------------------------------------------------------
+static const char * g_hot_dir = getenv("LLAMA_HOT_TRACE");
+static const int    g_hot_stride = [] {
+    const char * e = getenv("LLAMA_HOT_STRIDE");
+    const int v = e != nullptr ? atoi(e) : 8;
+    return v > 0 ? v : 1;
+}();
+static std::vector<void *> g_hot_retired;   // probe buffers grown during a run are retired, never freed
+static float * g_hot_buf   = nullptr;   // [16][n_kv] summed over heads
+static float * g_hot_max   = nullptr;   // [16][n_kv] max over heads
+static float * g_hot_head  = nullptr;   // [16][24][n_kv], only when LLAMA_HOT_PERHEAD is set
+static const char * g_hot_perhead = getenv("LLAMA_HOT_PERHEAD");
+// sentinel probe (tasks R2-5b/R2-5c): per (layer, query head, query) signals computed from the full KV
+static const int SENT_LAYERS = 16;
+static const int SENT_HEADS  = 24;
+static const int SENT_QCAP   = 256;     // query stride of the four scalar planes (the harness scores 32 per block)
+static const int SENT_HDR    = 1024;    // bytes of self-describing ASCII header in front of every dump
+static float * g_sent_gap   = nullptr;  // [16][24][256]
+static int   * g_sent_arg   = nullptr;  // [16][24][256]
+static float * g_sent_mass  = nullptr;  // [16][24][256] out-of-scratch attention mass
+static float * g_sent_delta = nullptr;  // [16][24][256] ||o_full - o_scr|| / ||o_full||
+static float * g_sent_page  = nullptr;  // fast mode: [query][24][n_page] for layer 12 only
+static bool g_sent_page_fast = false;
+static float * g_sent_page_host = nullptr; // pinned async destination for the compact layer-12 page plane
+static size_t  g_sent_page_host_bytes = 0;
+static cudaEvent_t g_sent_page_event = nullptr;
+static cudaStream_t g_sent_stream = nullptr;
+static int g_sent_page_host_npg = 0;
+static int g_sent_page_host_nq = 0;
+static bool g_sent_page_host_pending = false;
+// seq 205 exact-signal dump (opt-in LLAMA_SENT_QDUMP): LSE in/out and the three output norms, plus D's Q of the pass
+static float * g_sent_lsei  = nullptr;  // [16][256][24] log-sum-exp over in-scratch keys
+static float * g_sent_lseo  = nullptr;  // [16][256][24] log-sum-exp over out-of-scratch keys
+static float * g_sent_ofn   = nullptr;  // [16][256][24] ||o_full||
+static float * g_sent_osn   = nullptr;  // [16][256][24] ||o_scratch||
+static float * g_sent_dn    = nullptr;  // [16][256][24] ||o_full - o_scratch||
+static float * g_sent_q     = nullptr;  // [16][24][qcap][256] post-RoPE Q, native [head][query][dim] per layer
+static int     g_sent_qcap_q = 0;       // query capacity of the Q plane
+static int     g_sent_qcap  = 0;        // query capacity of the page plane (n_q of the first node, grow-only)
+static int     g_sent_npg   = 0;
+static int     g_sent_ptok  = 0;        // page size in tokens
+static int     g_sent_page_off = 0;     // stop retrying after a failed allocation
+static int     g_sent_npos  = 0;
+static int     g_sent_pos_base = 0;     // of the block being probed (for the dump header)
+static int     g_sent_kv_probe = 0;     // n_kv of the block being probed
+static int     g_sent_scratch_probe = 0;
+static int     g_sent_ptok_probe = 0;
+static int     g_hot_n_kv  = 0;
+static int     g_hot_layer = 0;
+static int     g_hot_used  = 0;
+
+struct sent_plane_desc {
+    const char * name;
+    const char * dtype;
+    int64_t off;
+    int64_t bytes;
+    int     rank;
+    int64_t shape[4];
+};
+
+// 1024-byte ASCII header: every plane carries its name, dtype, shape and absolute offset, so the reader never
+// has to guess the layout (Stage 1 defect: the old 3-int header did not say which array was where).
+static std::string sent_make_header(const std::string & keys, const sent_plane_desc * pl, int n_planes) {
+    char line[256];
+    std::string s = "SENTBIN\n";
+    s += keys;
+    for (int i = 0; i < n_planes; ++i) {
+        snprintf(line, sizeof(line), "plane=%s dtype=%s off=%lld bytes=%lld shape=", pl[i].name, pl[i].dtype,
+                 (long long) pl[i].off, (long long) pl[i].bytes);
+        s += line;
+        for (int r = 0; r < pl[i].rank; ++r) {
+            snprintf(line, sizeof(line), "%s%lld", r == 0 ? "" : ",", (long long) pl[i].shape[r]);
+            s += line;
+        }
+        s += "\n";
+    }
+    if ((int) s.size() > SENT_HDR) {
+        fprintf(stderr, "[sent] header too long (%zu bytes), truncated\n", s.size());
+    }
+    s.resize(SENT_HDR, '\0');
+    return s;
+}
+
+static std::string sent_key_lines(int qcap, int nq, int n_kv, int kn, int pos_base, int scratch_tokens,
+                                  int page_tokens, int n_page, int layer, const char * pass_name, int n_planes) {
+    char line[256];
+    std::string s;
+    snprintf(line, sizeof(line),
+             "version=2\nn_planes=%d\nlayers=%d\nheads=%d\nqcap=%d\nn_query=%d\nn_kv=%d\nkn=%d\n"
+             "pos_base=%d\nscratch_tokens=%d\npage_tokens=%d\nn_page=%d\nlayer=%d\npass=%s\n",
+             n_planes, SENT_LAYERS, SENT_HEADS, qcap, nq, n_kv, kn, pos_base, scratch_tokens, page_tokens,
+             n_page, layer, pass_name);
+    s += line;
+    return s;
+}
+
+// allocate/enlarge the page plane (grow-only, never freed: a retired block stays mapped for the run)
+static bool sent_page_ready(int n_q, int n_kv, int page_tokens, bool fast_mode, cudaStream_t stream) {
+    if (page_tokens <= 0 || g_sent_page_off) {
+        return false;
+    }
+    const int npg = (n_kv + page_tokens - 1) / page_tokens;
+    const int qcap = std::max(n_q, 32);
+    if (g_sent_page != nullptr && fast_mode == g_sent_page_fast && qcap <= g_sent_qcap && npg <= g_sent_npg) {
+        return true;
+    }
+    void * p = nullptr;
+    const size_t bytes = (size_t) (fast_mode ? 1 : SENT_LAYERS) * SENT_HEADS * qcap * npg * sizeof(float);
+    if (cudaMalloc(&p, bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        fprintf(stderr, "[sent] page plane allocation failed (%zu MiB)\n", bytes >> 20);
+        g_sent_page_off = 1;
+        return false;
+    }
+    if (g_sent_page != nullptr) {
+        g_hot_retired.push_back(g_sent_page);
+    }
+    g_sent_page = (float *) p;
+    g_sent_qcap = qcap;
+    g_sent_npg  = npg;
+    g_sent_ptok = page_tokens;
+    g_sent_page_fast = fast_mode;
+    (void) cudaMemsetAsync(g_sent_page, 0, bytes, stream);
+    fprintf(stderr, "[sent] page plane %s layers=%d heads=%d q=%d pages=%d tokens=%d = %.1f MiB\n",
+            fast_mode ? "layer12" : "all-layers", fast_mode ? 1 : SENT_LAYERS, SENT_HEADS,
+            qcap, npg, page_tokens, (double) bytes / 1048576.0);
+    return true;
+}
+
+static void ggml_cuda_hot_sent_end_eval() {
+    const char * sent_blk = getenv("LLAMA_SENT_BLOCK");
+    if (getenv("LLAMA_SENT_DEBUG") != nullptr && getenv("LLAMA_SENT_FAST_HEAT") != nullptr) {
+        fprintf(stderr, "[sent-fast-end-enter] dir=%p gap=%p blk=%s npos=%d page=%p pending=%d\n",
+                (void *) g_hot_dir, (void *) g_sent_gap, sent_blk ? sent_blk : "(null)", g_sent_npos,
+                (void *) g_sent_page, (int) g_sent_page_host_pending);
+    }
+    if (g_hot_dir == nullptr || g_sent_gap == nullptr || sent_blk == nullptr || sent_blk[0] == 0 ||
+            strcmp(sent_blk, "off") == 0 || g_sent_npos <= 0) {
+        return;
+    }
+    const char * fast_heat = getenv("LLAMA_SENT_FAST_HEAT");
+    if (fast_heat != nullptr && fast_heat[0] != 0 && getenv("LLAMA_SENT_DEBUG") != nullptr) {
+        fprintf(stderr, "[sent-fast-end] npos=%d page=%p fast=%d npg=%d stream=%p\n", g_sent_npos,
+                (void *) g_sent_page, (int) g_sent_page_fast, g_sent_npg, (void *) g_sent_stream);
+    }
+    if (fast_heat != nullptr && fast_heat[0] != 0 && strcmp(fast_heat, "0") != 0 &&
+            g_sent_page_fast && g_sent_page != nullptr && g_sent_stream != nullptr && g_sent_npg > 0) {
+        // only the probed queries' rows (index (qi * heads + h) * npg + page), not the whole qcap-sized plane
+        const size_t bytes = (size_t) SENT_HEADS * std::min(g_sent_npos, g_sent_qcap) * g_sent_npg * sizeof(float);
+        if (bytes > g_sent_page_host_bytes) {
+            if (g_sent_page_host != nullptr) {
+                (void) cudaFreeHost(g_sent_page_host);
+                g_sent_page_host = nullptr;
+                g_sent_page_host_bytes = 0;
+            }
+            if (cudaHostAlloc((void **) &g_sent_page_host, bytes, cudaHostAllocPortable) == cudaSuccess) {
+                g_sent_page_host_bytes = bytes;
+            }
+        }
+        if (g_sent_page_host != nullptr &&
+                (g_sent_page_event != nullptr || cudaEventCreateWithFlags(&g_sent_page_event, cudaEventDisableTiming) == cudaSuccess) &&
+                cudaMemcpyAsync(g_sent_page_host, g_sent_page, bytes, cudaMemcpyDeviceToHost, g_sent_stream) == cudaSuccess &&
+                cudaEventRecord(g_sent_page_event, g_sent_stream) == cudaSuccess) {
+            g_sent_page_host_npg = g_sent_npg;
+            g_sent_page_host_nq = std::min(g_sent_npos, g_sent_qcap);
+            g_sent_page_host_pending = true;
+            g_sent_npos = 0;
+            return;
+        }
+        (void) cudaGetLastError();
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    // one layer block is 24 * 256 floats (index = qi*n_head_q + h, the stride the kernel writes with), NOT
+    // 24 * n_q: reading 24*n_q bytes per layer shifted every layer after the first into the previous block
+    // (R2-5c Stage 0: that is why only 2 of 16 layers appeared to have data).
+    const size_t n = (size_t) SENT_LAYERS * SENT_HEADS * SENT_QCAP;
+    std::vector<float> hgap(n), hmass(n), hdelta(n);
+    std::vector<int>   harg(n);
+    if (cudaMemcpy(hgap.data(),  g_sent_gap,   n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(harg.data(),  g_sent_arg,   n * sizeof(int),   cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(hmass.data(), g_sent_mass,  n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(hdelta.data(), g_sent_delta, n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    std::string path = std::string(g_hot_dir) + "/sent_" + sent_blk + ".bin";
+    FILE * f = fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        return;
+    }
+    const char * pass_name = sent_blk[strlen(sent_blk) - 1] == 'f' ? "F" : "D";
+    sent_plane_desc pl[12];
+    int npl = 0;
+    int64_t off = SENT_HDR;
+    auto add_plane = [&](const char * name, const char * dtype, int64_t bytes, int rank,
+                         int64_t d0, int64_t d1, int64_t d2, int64_t d3) {
+        pl[npl].name = name; pl[npl].dtype = dtype; pl[npl].off = off; pl[npl].bytes = bytes;
+        pl[npl].rank = rank;
+        pl[npl].shape[0] = d0; pl[npl].shape[1] = d1; pl[npl].shape[2] = d2; pl[npl].shape[3] = d3;
+        off += bytes;
+        ++npl;
+    };
+    const int64_t scen = (int64_t) SENT_LAYERS * SENT_HEADS * SENT_QCAP;
+    // scalar planes are query-major: flat index = layer * qcap * heads + query * heads + head (the kernel's own
+    // stride, qi*n_head_q + h); the page plane appends the page index innermost.
+    add_plane("gap",    "f4", scen * 4, 3, SENT_LAYERS, SENT_QCAP, SENT_HEADS, 0);
+    add_plane("argmax", "i4", scen * 4, 3, SENT_LAYERS, SENT_QCAP, SENT_HEADS, 0);
+    add_plane("mass",   "f4", scen * 4, 3, SENT_LAYERS, SENT_QCAP, SENT_HEADS, 0);
+    add_plane("delta",  "f4", scen * 4, 3, SENT_LAYERS, SENT_QCAP, SENT_HEADS, 0);
+    const bool have_extra = g_sent_lsei != nullptr && g_sent_lseo != nullptr && g_sent_ofn != nullptr &&
+                            g_sent_osn != nullptr && g_sent_dn != nullptr;
+    const bool have_q = have_extra && g_sent_q != nullptr && g_sent_qcap_q > 0;
+    if (have_extra) {
+        add_plane("lse_in",  "f4", scen * 4, 3, SENT_LAYERS, SENT_QCAP, SENT_HEADS, 0);
+        add_plane("lse_out", "f4", scen * 4, 3, SENT_LAYERS, SENT_QCAP, SENT_HEADS, 0);
+        add_plane("onorm_f", "f4", scen * 4, 3, SENT_LAYERS, SENT_QCAP, SENT_HEADS, 0);
+        add_plane("onorm_s", "f4", scen * 4, 3, SENT_LAYERS, SENT_QCAP, SENT_HEADS, 0);
+        add_plane("dnorm",   "f4", scen * 4, 3, SENT_LAYERS, SENT_QCAP, SENT_HEADS, 0);
+    }
+    if (have_q) {
+        add_plane("q", "f4", (int64_t) SENT_LAYERS * SENT_HEADS * g_sent_qcap_q * 256 * 4, 4,
+                  SENT_LAYERS, SENT_HEADS, g_sent_qcap_q, 256);
+    }
+    const bool have_page = g_sent_page != nullptr && g_sent_npg > 0;
+    if (have_page) {
+        add_plane("page", "f4", (int64_t) SENT_LAYERS * SENT_HEADS * g_sent_qcap * g_sent_npg * 4, 4,
+                  SENT_LAYERS, g_sent_qcap, SENT_HEADS, g_sent_npg);
+    }
+    const char * ps = getenv("LLAMA_SENT_SCRATCH_TOKENS");
+    const int scratch_tokens = ps != nullptr ? atoi(ps) : 0;
+    (void) scratch_tokens;
+    std::string keys = sent_key_lines(SENT_QCAP, g_sent_npos, g_sent_kv_probe, 0, g_sent_pos_base,
+                                      g_sent_scratch_probe, have_page ? g_sent_ptok : 0,
+                                      have_page ? g_sent_npg : 0, -1, pass_name, npl);
+    if (have_q) {
+        char extra[128];
+        snprintf(extra, sizeof(extra), "q_qcap=%d\nq_layout=head,query,dim\n", g_sent_qcap_q);
+        keys += extra;
+    }
+    const std::string hdr = sent_make_header(keys, pl, npl);
+    fwrite(hdr.data(), 1, hdr.size(), f);
+    fwrite(hgap.data(),   sizeof(float), n, f);
+    fwrite(harg.data(),   sizeof(int),   n, f);
+    fwrite(hmass.data(),  sizeof(float), n, f);
+    fwrite(hdelta.data(), sizeof(float), n, f);
+    if (have_extra) {
+        std::vector<float> hbuf(n);
+        const size_t nb = n * sizeof(float);
+        if (cudaMemcpy(hbuf.data(), g_sent_lsei, nb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                fwrite(hbuf.data(), sizeof(float), n, f) != n) {
+            (void) cudaGetLastError();
+        }
+        if (cudaMemcpy(hbuf.data(), g_sent_lseo, nb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                fwrite(hbuf.data(), sizeof(float), n, f) != n) {
+            (void) cudaGetLastError();
+        }
+        if (cudaMemcpy(hbuf.data(), g_sent_ofn, nb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                fwrite(hbuf.data(), sizeof(float), n, f) != n) {
+            (void) cudaGetLastError();
+        }
+        if (cudaMemcpy(hbuf.data(), g_sent_osn, nb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                fwrite(hbuf.data(), sizeof(float), n, f) != n) {
+            (void) cudaGetLastError();
+        }
+        if (cudaMemcpy(hbuf.data(), g_sent_dn, nb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                fwrite(hbuf.data(), sizeof(float), n, f) != n) {
+            (void) cudaGetLastError();
+        }
+    }
+    if (have_q) {
+        const size_t nq = (size_t) SENT_LAYERS * SENT_HEADS * g_sent_qcap_q * 256;
+        std::vector<float> hq(nq);
+        if (cudaMemcpy(hq.data(), g_sent_q, nq * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+            fwrite(hq.data(), sizeof(float), nq, f);
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
+    if (have_page) {
+        const size_t np = (size_t) SENT_HEADS * g_sent_qcap * g_sent_npg;
+        std::vector<float> hp(np);
+        // optional: the same heat layout as block_<b>.bin ({n_layers, n_kv} header), built from the per-page
+        // out-of-scratch mass summed over the block's queries and over the heads, broadcast over each page's
+        // tokens. The harness's page policy can then use the sentinel instead of the hot-mass kernel.
+        const char * heat_env = getenv("LLAMA_SENT_HEAT");
+        FILE * fh = nullptr;
+        std::vector<float> hheat;
+        // the token extent is the page plane's, not the FA node's: k->ne[1] is a padded KV view that differs
+        // between evals (measured: 203,520 on early blocks, 203,776 later), and a heat file whose n_kv changes
+        // per block cannot be summed with another block's (reviewer seq 164). npg * ptok is fixed by the
+        // allocation, so every heat file has the same shape.
+        const int heat_n_kv = g_sent_ptok > 0 ? g_sent_npg * g_sent_ptok : 0;
+        if (heat_env != nullptr && heat_env[0] != 0 && heat_n_kv > 0) {
+            hheat.assign((size_t) SENT_LAYERS * heat_n_kv, 0.0f);
+            fh = fopen(heat_env, "wb");
+            if (fh != nullptr) {
+                const int hh[2] = { SENT_LAYERS, heat_n_kv };
+                fwrite(hh, sizeof(int), 2, fh);
+            }
+        }
+        for (int l = 0; l < SENT_LAYERS; ++l) {
+            if (cudaMemcpy(hp.data(), g_sent_page + (size_t) l * np, np * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                (void) cudaGetLastError();
+                break;
+            }
+            fwrite(hp.data(), sizeof(float), np, f);
+            if (!hheat.empty()) {
+                const int nq = g_sent_npos;
+                for (int pg = 0; pg < g_sent_npg; ++pg) {
+                    double acc = 0.0;
+                    for (int qi = 0; qi < nq; ++qi) {
+                        for (int h = 0; h < SENT_HEADS; ++h) {
+                            acc += hp[((size_t) qi * SENT_HEADS + h) * g_sent_npg + pg];
+                        }
+                    }
+                    const int t0 = pg * g_sent_ptok;
+                    const int t1 = std::min(t0 + g_sent_ptok, heat_n_kv);
+                    for (int t = t0; t < t1; ++t) {
+                        hheat[(size_t) l * heat_n_kv + t] = (float) acc;
+                    }
+                }
+            }
+        }
+        if (fh != nullptr) {
+            fwrite(hheat.data(), sizeof(float), hheat.size(), fh);
+            fclose(fh);
+        }
+    }
+    fclose(f);
+    g_sent_npos = 0;
+}
+
+// as ggml_backend_cuda_get_sent_page_scores, but summing only probed queries [q_lo, q_hi) (clamped); with
+// LLAMA_SENT_Q_STRIDE, probed query i is the node's query i * stride
+extern "C" GGML_BACKEND_API bool ggml_backend_cuda_get_sent_page_scores_q(float * scores, int capacity, int * n_pages,
+                                                                         int q_lo, int q_hi);
+extern "C" GGML_BACKEND_API bool ggml_backend_cuda_get_sent_page_scores(float * scores, int capacity, int * n_pages) {
+    return ggml_backend_cuda_get_sent_page_scores_q(scores, capacity, n_pages, 0, INT32_MAX);
+}
+extern "C" GGML_BACKEND_API bool ggml_backend_cuda_get_sent_page_scores_q(float * scores, int capacity, int * n_pages,
+                                                                         int q_lo, int q_hi) {
+    if (scores == nullptr || n_pages == nullptr || !g_sent_page_host_pending ||
+            g_sent_page_event == nullptr || g_sent_page_host == nullptr || g_sent_page_host_npg <= 0 ||
+            capacity < g_sent_page_host_npg) {
+        return false;
+    }
+    // Wait only for the compact async heat transfer on the F stream; do not synchronize the whole device.
+    if (cudaEventSynchronize(g_sent_page_event) != cudaSuccess) {
+        (void) cudaGetLastError();
+        g_sent_page_host_pending = false;
+        return false;
+    }
+    const int nq = g_sent_page_host_nq;
+    const int npg = g_sent_page_host_npg;
+    std::fill(scores, scores + npg, 0.0f);
+    for (int qi = std::max(0, q_lo); qi < std::min(nq, q_hi); ++qi) {
+        for (int h = 0; h < SENT_HEADS; ++h) {
+            const float * row = g_sent_page_host + ((size_t) qi * SENT_HEADS + h) * npg;
+            for (int pg = 0; pg < npg; ++pg) {
+                scores[pg] += row[pg];
+            }
+        }
+    }
+    *n_pages = npg;
+    g_sent_page_host_pending = false;
+    return true;
+}
+
+// R2-5c: single entry point so the probe also runs for layers the staged-KV plan dispatches itself.
+void ggml_cuda_hot_probe_node(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    // only attention nodes are probed (and counted): return before the env reads below, which would otherwise
+    // run for every node of every eval (~4600 getenv calls, ~15 ms per 178K decode step on Windows)
+    if (node->op != GGML_OP_FLASH_ATTN_EXT) {
+        return;
+    }
+    // Hot-trace allocations are intentionally opt-in, but real prefills grow n_kv on every
+    // ubatch. Let callers pause all probe work during prefill / scratch-only decode, then
+    // enable it only for the F checks that need to produce heat. Read per eval so the
+    // setting can change without restarting the process.
+    const char * hot_pause = getenv("LLAMA_HOT_PAUSE");
+    if (hot_pause != nullptr && hot_pause[0] != '\0' && strcmp(hot_pause, "0") != 0) {
+        return;
+    }
+    const char * fast_heat_env = getenv("LLAMA_SENT_FAST_HEAT");
+    const bool sent_fast_mode = fast_heat_env != nullptr && fast_heat_env[0] != 0 && strcmp(fast_heat_env, "0") != 0;
+    if (getenv("LLAMA_FA_NODE_TRACE") != nullptr) {
+        fprintf(stderr, "[probe] hl=%d n_kv=%lld name=%.20s", g_hot_layer,
+                (long long) (node->src[1] ? node->src[1]->ne[1] : -1), node->name);
+        fputc(10, stderr);
+    }
+// Hotness + sentinel probe for one FLASH_ATTN_EXT node (opt-in LLAMA_HOT_TRACE). Called from the node loop
+// for nodes the staged-KV plan does not own, and from the plan itself (staged-kv.cuh) with K pointing at the
+// per-layer staging slot, which holds the full used prefix - so staged layers are visible too.
+if (g_hot_dir != nullptr && node->op == GGML_OP_FLASH_ATTN_EXT && node->src[1] != nullptr &&
+        node->src[3] != nullptr && node->src[0]->ne[0] == 256) {
+    if (sent_fast_mode && getenv("LLAMA_SENT_DEBUG") != nullptr) {
+        const char * pp = getenv("LLAMA_SENT_PAGES");
+        fprintf(stderr, "[sent-fast] layer=%d q=%lld fast=%d page=%s stream=%p\n", g_hot_layer,
+                (long long) node->src[0]->ne[1], (int) sent_fast_mode, pp ? pp : "(null)", (void *) ctx.stream());
+    }
+    const int n_kv = (int) node->src[1]->ne[1];
+    if (!sent_fast_mode && (g_hot_buf == nullptr || n_kv > g_hot_n_kv)) {
+        // grow-only, never free (see the sentinel comment below)
+        if (g_hot_buf != nullptr) {
+            g_hot_retired.push_back(g_hot_buf);
+        }
+        g_hot_n_kv = std::max(n_kv, 1 << 14);
+        if (cudaMalloc(&g_hot_buf, (size_t) 16 * g_hot_n_kv * sizeof(float)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            g_hot_buf = nullptr;
+            g_hot_dir = nullptr;
+            return;
+        }
+        (void) cudaMemset(g_hot_buf, 0, (size_t) 16 * g_hot_n_kv * sizeof(float));
+        if (g_hot_max  != nullptr) { g_hot_retired.push_back(g_hot_max);  g_hot_max  = nullptr; }
+        if (g_hot_head != nullptr) { g_hot_retired.push_back(g_hot_head); g_hot_head = nullptr; }
+        if (cudaMalloc(&g_hot_max, (size_t) 16 * g_hot_n_kv * sizeof(float)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            g_hot_max = nullptr;
+        }
+        if (g_hot_perhead != nullptr) {
+            if (cudaMalloc(&g_hot_head, (size_t) 16 * 24 * g_hot_n_kv * sizeof(float)) != cudaSuccess) {
+                (void) cudaGetLastError();
+                g_hot_head = nullptr;
+            }
+        }
+    }
+    if (!sent_fast_mode && g_hot_layer == 0) {
+        (void) cudaMemsetAsync(g_hot_buf, 0, (size_t) 16 * g_hot_n_kv * sizeof(float),
+                               ctx.stream());
+        if (g_hot_max != nullptr) {
+            (void) cudaMemsetAsync(g_hot_max, 0, (size_t) 16 * g_hot_n_kv * sizeof(float),
+                                   ctx.stream());
+        }
+        if (g_hot_head != nullptr) {
+            (void) cudaMemsetAsync(g_hot_head, 0,
+                                   (size_t) 16 * 24 * g_hot_n_kv * sizeof(float),
+                                   ctx.stream());
+        }
+    }
+    if (g_hot_layer < 16) {
+        float scale = 0.0f;
+        memcpy(&scale, node->op_params, sizeof(float));
+        const int n_head_q = (int) node->src[0]->ne[2];
+        const int n_head_kv = (int) node->src[1]->ne[2];
+      if (!sent_fast_mode) {
+        if (n_head_q > 0 && n_head_kv > 0 && n_head_q % n_head_kv == 0) {
+            float * mass = g_hot_buf + (size_t) g_hot_layer * g_hot_n_kv;
+            float * mass_max = g_hot_max != nullptr ? g_hot_max + (size_t) g_hot_layer * g_hot_n_kv : nullptr;
+            float * perhead  = g_hot_head != nullptr ? g_hot_head + (size_t) g_hot_layer * 24 * g_hot_n_kv : nullptr;
+            ggml_cuda_hot_mass(node->src[0], node->src[1], node->src[3], scale,
+                               n_head_q, n_head_kv, g_hot_stride, mass, mass_max, perhead,
+                               ctx.stream());
+      }
+      }
+            const char * sent_blk = getenv("LLAMA_SENT_BLOCK");
+            if (sent_blk != nullptr && sent_blk[0] != 0 && strcmp(sent_blk, "off") != 0 &&
+                    node->src[3] != nullptr) {
+                if (g_sent_gap == nullptr) {
+                    // all-or-nothing, allocated once for the process lifetime (never freed: the stream is
+                    // non-blocking, so freeing while a previous eval's kernels are queued hands the memory to the
+                    // next kernel - that is a use-after-free inside whatever runs next, e.g. dq4_launch)
+                    void * p0 = nullptr; void * p1 = nullptr; void * p2 = nullptr; void * p3 = nullptr;
+                    const size_t ns = (size_t) SENT_LAYERS * SENT_HEADS * SENT_QCAP;
+                    if (cudaMalloc(&p0, ns * sizeof(float)) == cudaSuccess &&
+                            cudaMalloc(&p1, ns * sizeof(int)) == cudaSuccess &&
+                            cudaMalloc(&p2, ns * sizeof(float)) == cudaSuccess &&
+                            cudaMalloc(&p3, ns * sizeof(float)) == cudaSuccess) {
+                        g_sent_gap   = (float *) p0;
+                        g_sent_arg   = (int *)   p1;
+                        g_sent_mass  = (float *) p2;
+                        g_sent_delta = (float *) p3;
+                    } else {
+                        (void) cudaGetLastError();
+                        if (p0) { (void) cudaFree(p0); }
+                        if (p1) { (void) cudaFree(p1); }
+                        if (p2) { (void) cudaFree(p2); }
+                        if (p3) { (void) cudaFree(p3); }
+                    }
+                }
+                // LLAMA_SENT_MAX_Q (opt-in): probe only the first N queries of the node. Page selection needs a few
+                // queries, and probing every query of a wide check costs ~30 ms per query at 130K.
+                const char * sent_max_q_env = getenv("LLAMA_SENT_MAX_Q");
+                const int sent_max_q = sent_max_q_env != nullptr ? atoi(sent_max_q_env) : 0;
+                // LLAMA_SENT_Q_STRIDE (opt-in, fast page heat only): probe every stride-th query, so a few probed
+                // queries span the whole check and the caller can keep the ones before the first mismatch
+                const char * sent_qs_env = getenv("LLAMA_SENT_Q_STRIDE");
+                const int sent_q_stride = sent_fast_mode && sent_qs_env != nullptr && atoi(sent_qs_env) > 1 &&
+                                          getenv("LLAMA_SENT_HEAT_LEGACY") == nullptr ? atoi(sent_qs_env) : 1;
+                const int n_q_node = (int) ((node->src[0]->ne[1] + sent_q_stride - 1) / sent_q_stride);
+                const int n_q = sent_max_q > 0 ? std::min<int>(n_q_node, sent_max_q) : n_q_node;
+                ggml_tensor sent_q_view = *node->src[0];
+                sent_q_view.ne[1] = n_q;
+                sent_q_view.nb[1] = node->src[0]->nb[1] * sent_q_stride;
+                ggml_tensor sent_mask_view;
+                const ggml_tensor * sent_mask = node->src[3];
+                if (sent_mask != nullptr && (n_q < (int) node->src[0]->ne[1] || sent_q_stride > 1)) {
+                    sent_mask_view = *sent_mask;
+                    sent_mask_view.ne[1] = std::min<int64_t>(sent_mask->ne[1], n_q);
+                    sent_mask_view.nb[1] = sent_mask->nb[1] * sent_q_stride;
+                    sent_mask = &sent_mask_view;
+                }
+                if (g_sent_gap == nullptr || n_q > SENT_QCAP || (sent_fast_mode && g_hot_layer != 12)) {
+                    if (n_q > SENT_QCAP && getenv("LLAMA_SENT_DEBUG") != nullptr) {
+                        fprintf(stderr, "[sent] n_q=%d exceeds the %d-query plane, skipped\n", n_q, SENT_QCAP);
+                    }
+                } else {
+                    // seq 205: the extra exact planes and the Q copy belong to the D pass (the mask defines the
+                    // scratch there); the F pass keeps its heat-only job
+                    const bool qdump = getenv("LLAMA_SENT_QDUMP") != nullptr &&
+                                       sent_blk != nullptr && sent_blk[0] != 0 &&
+                                       sent_blk[strlen(sent_blk) - 1] == 'd';
+                    if (qdump && g_sent_lsei == nullptr) {
+                        void * p0 = nullptr; void * p1 = nullptr; void * p2 = nullptr; void * p3 = nullptr;
+                        void * p4 = nullptr;
+                        const size_t ns = (size_t) SENT_LAYERS * SENT_HEADS * SENT_QCAP;
+                        if (cudaMalloc(&p0, ns * sizeof(float)) == cudaSuccess &&
+                                cudaMalloc(&p1, ns * sizeof(float)) == cudaSuccess &&
+                                cudaMalloc(&p2, ns * sizeof(float)) == cudaSuccess &&
+                                cudaMalloc(&p3, ns * sizeof(float)) == cudaSuccess &&
+                                cudaMalloc(&p4, ns * sizeof(float)) == cudaSuccess) {
+                            g_sent_lsei = (float *) p0;
+                            g_sent_lseo = (float *) p1;
+                            g_sent_ofn  = (float *) p2;
+                            g_sent_osn  = (float *) p3;
+                            g_sent_dn   = (float *) p4;
+                        } else {
+                            (void) cudaGetLastError();
+                            if (p0) { (void) cudaFree(p0); }
+                            if (p1) { (void) cudaFree(p1); }
+                            if (p2) { (void) cudaFree(p2); }
+                            if (p3) { (void) cudaFree(p3); }
+                            if (p4) { (void) cudaFree(p4); }
+                        }
+                    }
+                    if (qdump && (g_sent_q == nullptr || n_q > g_sent_qcap_q)) {
+                        void * pq = nullptr;
+                        const int qcap = std::max(n_q, 32);
+                        const size_t qb = (size_t) SENT_LAYERS * SENT_HEADS * qcap * 256 * sizeof(float);
+                        if (cudaMalloc(&pq, qb) == cudaSuccess) {
+                            if (g_sent_q != nullptr) {
+                                g_hot_retired.push_back(g_sent_q);
+                            }
+                            g_sent_q = (float *) pq;
+                            g_sent_qcap_q = qcap;
+                        } else {
+                            (void) cudaGetLastError();
+                        }
+                    }
+                    const char * pb = getenv("LLAMA_SENT_POS_BASE");
+                    const int pos_base = pb != nullptr ? atoi(pb) : 0;
+                    const char * pst = getenv("LLAMA_SENT_SCRATCH_TOKENS");
+                    const int scratch_tokens = pst != nullptr ? atoi(pst) : 0;
+                    const char * ppg = getenv("LLAMA_SENT_PAGES");
+                    const int page_tokens = ppg != nullptr ? atoi(ppg) : 0;
+                    // delta and the page plane need V; only use it when its layout matches K (q4_0, same strides)
+                    const ggml_tensor * vt = node->src[2];
+                    const bool v_ok = vt != nullptr && vt->type == node->src[1]->type &&
+                            vt->nb[1] == node->src[1]->nb[1] && vt->nb[2] == node->src[1]->nb[2] &&
+                            vt->ne[1] == node->src[1]->ne[1];
+                    float * page_out = nullptr;
+                    g_sent_stream = ctx.stream();
+                    const bool fast_pages = sent_fast_mode;
+                    if (page_tokens > 0 && (!fast_pages || g_hot_layer == 12) &&
+                            sent_page_ready(n_q, n_kv, page_tokens, fast_pages, ctx.stream())) {
+                        page_out = g_sent_page + (fast_pages ? 0 : (size_t) g_hot_layer * SENT_HEADS * g_sent_qcap * g_sent_npg);
+                    }
+                    g_sent_pos_base      = pos_base;
+                    g_sent_kv_probe      = n_kv;
+                    g_sent_scratch_probe = scratch_tokens;
+                    g_sent_ptok_probe    = page_tokens;
+                    if (g_hot_layer == 0) {
+                        (void) cudaMemsetAsync(g_sent_gap, 0, (size_t) SENT_LAYERS * SENT_HEADS * SENT_QCAP * sizeof(float),
+                                               ctx.stream());
+                        (void) cudaMemsetAsync(g_sent_arg, 0, (size_t) SENT_LAYERS * SENT_HEADS * SENT_QCAP * sizeof(int),
+                                               ctx.stream());
+                        (void) cudaMemsetAsync(g_sent_mass, 0, (size_t) SENT_LAYERS * SENT_HEADS * SENT_QCAP * sizeof(float),
+                                               ctx.stream());
+                        (void) cudaMemsetAsync(g_sent_delta, 0, (size_t) SENT_LAYERS * SENT_HEADS * SENT_QCAP * sizeof(float),
+                                               ctx.stream());
+                        if (g_sent_lsei != nullptr) {
+                            const size_t nb = (size_t) SENT_LAYERS * SENT_HEADS * SENT_QCAP * sizeof(float);
+                            (void) cudaMemsetAsync(g_sent_lsei, 0, nb, ctx.stream());
+                            (void) cudaMemsetAsync(g_sent_lseo, 0, nb, ctx.stream());
+                            (void) cudaMemsetAsync(g_sent_ofn,  0, nb, ctx.stream());
+                            (void) cudaMemsetAsync(g_sent_osn,  0, nb, ctx.stream());
+                            (void) cudaMemsetAsync(g_sent_dn,   0, nb, ctx.stream());
+                        }
+                        if (g_sent_page != nullptr) {
+                            (void) cudaMemsetAsync(g_sent_page, 0,
+                                    (size_t) (g_sent_page_fast ? 1 : SENT_LAYERS) * SENT_HEADS *
+                                    g_sent_qcap * g_sent_npg * sizeof(float),
+                                    ctx.stream());
+                        }
+                    }
+                    if (getenv("LLAMA_SENT_DEBUG") != nullptr) {
+                        fprintf(stderr, "[sent] counter=%d node=%.40s q=%.40s n_q=%d n_kv=%d hq=%d hkv=%d "
+                                "scratch=%d v=%d page=%d npg=%d\n",
+                                g_hot_layer, node->name, node->src[0]->name, n_q, n_kv,
+                                n_head_q, n_head_kv, scratch_tokens, (int) v_ok, page_tokens, g_sent_npg);
+                        fflush(stderr);
+                    }
+                    // Fast heat only needs the page plane: the page-parallel kernel computes it without the
+                    // sentinel's other planes (LLAMA_SENT_HEAT_LEGACY=1 keeps the sentinel). Each check starts
+                    // from an empty plane, so the pages follow the latest check (the layer-0 reset above is
+                    // never reached in fast mode); LLAMA_SENT_HEAT_ACCUM=1 keeps summing over all checks.
+                    bool page_only = false;
+                    if (fast_pages && page_out != nullptr && !qdump) {
+                        if (getenv("LLAMA_SENT_HEAT_ACCUM") == nullptr) {
+                            (void) cudaMemsetAsync(g_sent_page, 0, (size_t) SENT_HEADS * g_sent_qcap * g_sent_npg * sizeof(float),
+                                                   ctx.stream());
+                        }
+                        page_only = getenv("LLAMA_SENT_HEAT_LEGACY") == nullptr &&
+                            ggml_cuda_hot_page_heat(&sent_q_view, node->src[1], sent_mask, scale, n_head_q, n_head_kv,
+                                                    pos_base, sent_q_stride, scratch_tokens, page_tokens, g_sent_npg,
+                                                    page_out, ctx.stream());
+                    }
+                    if (!page_only) {
+                    ggml_cuda_hot_sentinel(&sent_q_view, node->src[1], v_ok ? vt : nullptr, sent_mask, scale,
+                                           n_head_q, n_head_kv, 1, pos_base, scratch_tokens,
+                                           page_tokens, g_sent_npg,
+                                           g_sent_gap + (size_t) g_hot_layer * 24 * 256,
+                                           g_sent_arg + (size_t) g_hot_layer * 24 * 256,
+                                           g_sent_mass + (size_t) g_hot_layer * 24 * 256,
+                                           g_sent_delta + (size_t) g_hot_layer * 24 * 256,
+                                           page_out,
+                                           g_sent_lsei != nullptr ? g_sent_lsei + (size_t) g_hot_layer * 24 * 256 : nullptr,
+                                           g_sent_lseo != nullptr ? g_sent_lseo + (size_t) g_hot_layer * 24 * 256 : nullptr,
+                                           g_sent_ofn  != nullptr ? g_sent_ofn  + (size_t) g_hot_layer * 24 * 256 : nullptr,
+                                           g_sent_osn  != nullptr ? g_sent_osn  + (size_t) g_hot_layer * 24 * 256 : nullptr,
+                                           g_sent_dn   != nullptr ? g_sent_dn   + (size_t) g_hot_layer * 24 * 256 : nullptr,
+                                           ctx.stream());
+                    }
+                    if (qdump && g_sent_q != nullptr) {
+                        // Q is read inside the node (its buffer may be reused after the attention node)
+                        const size_t qb = (size_t) 256 * n_q * n_head_q * sizeof(float);
+                        (void) cudaMemcpyAsync(g_sent_q + (size_t) g_hot_layer * 256 * g_sent_qcap_q * 24,
+                                               node->src[0]->data, qb, cudaMemcpyDeviceToDevice, ctx.stream());
+                    }
+                    g_sent_npos = std::max(g_sent_npos, n_q);
+
+                    // R2-5c reference dump (opt-in LLAMA_SENT_DUMP=<file>): the raw inputs of this node plus the
+                    // kernel's own gap / argmax / mass / delta, so every signal can be recomputed on the CPU with
+                    // no assumption about eval ordering. LLAMA_SENT_DUMP_LAYER=<layer>, or -1 for all of them.
+                    const char * dump_path = getenv("LLAMA_SENT_DUMP");
+                    if (dump_path != nullptr && dump_path[0] != 0) {
+                        static const int dump_layer = [] {
+                            const char * e = getenv("LLAMA_SENT_DUMP_LAYER");
+                            return e != nullptr ? atoi(e) : 0;
+                        }();
+                        if (dump_layer < 0 || g_hot_layer == dump_layer) {
+                            if (cudaDeviceSynchronize() == cudaSuccess) {
+                                const int64_t kn = node->src[1]->nb[1]; // bytes per key row
+                                const int64_t kn0 = node->src[1]->ne[1]; // n_kv
+                                std::vector<float>    hq((size_t) (n_q * n_head_q * 256));
+                                std::vector<uint16_t> hm((size_t) (n_q * kn0));
+                                std::vector<uint8_t>  hk((size_t) (kn * kn0));
+                                std::vector<uint8_t>  hv((size_t) (kn * kn0));
+                                std::vector<float>    kgap(24 * 256), kmass(24 * 256), kdelta(24 * 256);
+                                std::vector<int32_t>  karg(24 * 256, -1);
+                                // this layer's own slice of the scalar planes
+                                (void) cudaMemcpy(kgap.data(),   g_sent_gap   + (size_t) g_hot_layer * 24 * 256,
+                                                  kgap.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                                (void) cudaMemcpy(karg.data(),   g_sent_arg   + (size_t) g_hot_layer * 24 * 256,
+                                                  karg.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+                                (void) cudaMemcpy(kmass.data(),  g_sent_mass  + (size_t) g_hot_layer * 24 * 256,
+                                                  kmass.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                                (void) cudaMemcpy(kdelta.data(), g_sent_delta + (size_t) g_hot_layer * 24 * 256,
+                                                  kdelta.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                                (void) cudaMemcpy(hq.data(), (const char *) node->src[0]->data,
+                                        hq.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                                (void) cudaMemcpy(hm.data(), (const char *) node->src[3]->data,
+                                        hm.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+                                (void) cudaMemcpy(hk.data(), (const char *) node->src[1]->data,
+                                        hk.size(), cudaMemcpyDeviceToHost);
+                                if (v_ok) {
+                                    (void) cudaMemcpy(hv.data(), (const char *) vt->data,
+                                            hv.size(), cudaMemcpyDeviceToHost);
+                                }
+                                // one node per pass: keep the two passes apart (dump_path.<tag>), and append when
+                                // every layer is dumped so the blocks stay in eval order
+                                std::string dpath = dump_path;
+                                FILE * fd = nullptr;
+                                if (dump_layer < 0) {
+                                    fd = fopen(dpath.c_str(), "ab");
+                                } else {
+                                    dpath += std::string(".") + sent_blk;
+                                    fd = fopen(dpath.c_str(), "wb");
+                                }
+                                if (fd != nullptr) {
+                                    sent_plane_desc dp[8];
+                                    int npl = 0;
+                                    int64_t off = SENT_HDR;
+                                    auto addp = [&](const char * name, const char * dtype, int64_t bytes,
+                                                    int rank, int64_t d0, int64_t d1, int64_t d2) {
+                                        dp[npl].name = name; dp[npl].dtype = dtype; dp[npl].off = off;
+                                        dp[npl].bytes = bytes; dp[npl].rank = rank;
+                                        dp[npl].shape[0] = d0; dp[npl].shape[1] = d1; dp[npl].shape[2] = d2;
+                                        dp[npl].shape[3] = 0;
+                                        off += bytes;
+                                        ++npl;
+                                    };
+                                    // the kernel writes [query][head]: the layer slice is qcap * heads, query-major
+                                    addp("kgap",   "f4", (int64_t) kgap.size() * 4,   2, SENT_QCAP, SENT_HEADS, 0);
+                                    addp("kargmax", "i4", (int64_t) karg.size() * 4,  2, SENT_QCAP, SENT_HEADS, 0);
+                                    addp("kmass",  "f4", (int64_t) kmass.size() * 4,  2, SENT_QCAP, SENT_HEADS, 0);
+                                    addp("kdelta", "f4", (int64_t) kdelta.size() * 4, 2, SENT_QCAP, SENT_HEADS, 0);
+                                    addp("q", "f4", (int64_t) hq.size() * 4, 3, n_q, n_head_q, 256);
+                                    addp("mask", "f2", (int64_t) hm.size() * 2, 2, n_q, kn0, 0);
+                                    addp("k", "u1", (int64_t) hk.size(), 2, kn0, kn, 0);
+                                    if (v_ok) {
+                                        addp("v", "u1", (int64_t) hv.size(), 2, kn0, kn, 0);
+                                    }
+                                    std::string keys = sent_key_lines(SENT_QCAP, n_q, (int) kn0, (int) kn, pos_base,
+                                                                   scratch_tokens, page_tokens, g_sent_npg,
+                                                                   g_hot_layer,
+                                                                   sent_blk[strlen(sent_blk) - 1] == 'f' ? "F" : "D",
+                                                                   npl);
+                                    char extra[192];
+                                    snprintf(extra, sizeof(extra), "q_nb1=%lld\nq_nb2=%lld\nk_nb2=%lld\nmask_nb1=%lld\n",
+                                             (long long) node->src[0]->nb[1], (long long) node->src[0]->nb[2],
+                                             (long long) node->src[1]->nb[2], (long long) node->src[3]->nb[1]);
+                                    keys += extra;
+                                    const std::string hdr = sent_make_header(keys, dp, npl);
+                                    fwrite(hdr.data(), 1, hdr.size(), fd);
+                                    fwrite(kgap.data(),   sizeof(float), kgap.size(), fd);
+                                    fwrite(karg.data(),   sizeof(int32_t), karg.size(), fd);
+                                    fwrite(kmass.data(),  sizeof(float), kmass.size(), fd);
+                                    fwrite(kdelta.data(), sizeof(float), kdelta.size(), fd);
+                                    fwrite(hq.data(), sizeof(float), hq.size(), fd);
+                                    fwrite(hm.data(), sizeof(uint16_t), hm.size(), fd);
+                                    fwrite(hk.data(), 1, hk.size(), fd);
+                                    if (v_ok) {
+                                        fwrite(hv.data(), 1, hv.size(), fd);
+                                    }
+                                    fclose(fd);
+                                }
+                            } else {
+                                (void) cudaGetLastError();
+                            }
+                        }
+                    }
+                }
+            }
+            g_hot_used = std::max(g_hot_used, g_hot_layer + 1);
+        ++g_hot_layer;
+    }
+}
+}
+
+static void ggml_cuda_hot_end_eval() {
+    if (g_hot_dir == nullptr || g_hot_buf == nullptr || g_hot_used == 0) {
+        return;
+    }
+    const char * blk = getenv("LLAMA_HOT_BLOCK");
+    if (blk == nullptr || blk[0] == 0 || strcmp(blk, "off") == 0) {
+        return;
+    }
+    // the compute stream is non-blocking, and cudaMemcpy syncs only the default stream: without this the
+    // download races the mass kernels (measured: 64 kernel launches, all-zero dump)
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    const size_t n = (size_t) g_hot_used * g_hot_n_kv;
+    std::vector<float> host(n);
+    if (cudaMemcpy(host.data(), g_hot_buf, n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    std::string path = std::string(g_hot_dir) + "/block_" + blk + ".bin";
+    FILE * f = fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        return;
+    }
+    const int hdr[2] = { g_hot_used, g_hot_n_kv };
+    fwrite(hdr, sizeof(int), 2, f);
+    fwrite(host.data(), sizeof(float), n, f);
+    fclose(f);
+
+    // same layout for the max-over-heads variant
+    if (g_hot_max != nullptr) {
+        if (cudaMemcpy(host.data(), g_hot_max, n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+        std::string path2 = std::string(g_hot_dir) + "/block_" + blk + "_max.bin";
+        FILE * f2 = fopen(path2.c_str(), "wb");
+        if (f2 != nullptr) {
+            fwrite(hdr, sizeof(int), 2, f2);
+            fwrite(host.data(), sizeof(float), n, f2);
+            fclose(f2);
+        }
+    }
+    // per-head dump, only for the block named in LLAMA_HOT_PERHEAD (it is 24x bigger)
+    if (g_hot_head != nullptr && g_hot_perhead != nullptr && strcmp(g_hot_perhead, blk) == 0) {
+        const size_t nh = (size_t) g_hot_used * 24 * g_hot_n_kv;
+        std::vector<float> hosth(nh);
+        if (cudaMemcpy(hosth.data(), g_hot_head, nh * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+            std::string path3 = std::string(g_hot_dir) + "/block_" + blk + "_head.bin";
+            FILE * f3 = fopen(path3.c_str(), "wb");
+            if (f3 != nullptr) {
+                const int hdr3[3] = { g_hot_used, 24, g_hot_n_kv };
+                fwrite(hdr3, sizeof(int), 3, f3);
+                fwrite(hosth.data(), sizeof(float), nh, f3);
+                fclose(f3);
+            }
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
+}
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
 
     int device;
+    int stream_no = -1;
     struct ggml_cuda_buffer {
         void * ptr = nullptr;
         size_t size = 0;
@@ -477,12 +1448,21 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
+    size_t peak_size = 0;
 
-    explicit ggml_cuda_pool_leg(int device) :
-        device(device) {
+    explicit ggml_cuda_pool_leg(int device, int stream_no = -1) :
+        device(device), stream_no(stream_no) {
+        ggml_cuda_mem_trace_register_pool(this, device, stream_no);
+        ggml_cuda_mem_trace_line("pool_create dev=%d stream=%d type=leg", device, stream_no);
+    }
+
+    void stats(size_t & cached, size_t & peak) const override {
+        cached = pool_size;
+        peak   = peak_size;
     }
 
     ~ggml_cuda_pool_leg() {
+        ggml_cuda_mem_trace_unregister_pool(this);
         clear_pool();
         GGML_ASSERT(pool_size == 0);
     }
@@ -542,22 +1522,45 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
+        const bool trace = ggml_cuda_mem_trace_enabled() && look_ahead_size >= ggml_cuda_mem_trace_min_bytes();
+        const size_t free_before = trace ? ggml_cuda_mem_trace_free(device) : 0;
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
             const size_t cached_bytes = pool_size;
             GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
+            if (ggml_cuda_mem_trace_enabled()) {
+                // The legacy pool can only flush its own buffers, so report what every pool holds.
+                ggml_cuda_mem_trace_line("pool_alloc_FAIL dev=%d stream=%d node=%s req=%.2f MiB cached_here=%.2f MiB",
+                                         device, stream_no, g_mem_trace_node,
+                                         (double) look_ahead_size / 1048576.0, (double) pool_size / 1048576.0);
+                ggml_cuda_mem_trace_dump(device, "pool_alloc_FAIL_state");
+            }
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
             err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
+            } else if (ggml_cuda_mem_trace_enabled()) {
+                ggml_cuda_mem_trace_line("pool_alloc_FAIL_retry dev=%d stream=%d node=%s req=%.2f MiB cached_after_flush=%.2f MiB",
+                                         device, stream_no, g_mem_trace_node,
+                                         (double) look_ahead_size / 1048576.0, (double) pool_size / 1048576.0);
+                ggml_cuda_mem_trace_dump(device, "pool_alloc_FAIL_retry_state");
             }
         }
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        peak_size = std::max(peak_size, pool_size);
+        if (trace) {
+            ggml_cuda_mem_trace_line("pool_alloc dev=%d stream=%d node=%s req=%.2f MiB got=%.2f MiB cached_now=%.2f peak=%.2f free_before=%.2f MiB free_after=%.2f MiB",
+                                     device, stream_no, g_mem_trace_node,
+                                     (double) size / 1048576.0, (double) look_ahead_size / 1048576.0,
+                                     (double) pool_size / 1048576.0, (double) peak_size / 1048576.0,
+                                     (double) free_before / 1048576.0,
+                                     (double) ggml_cuda_mem_trace_free(device) / 1048576.0);
+        }
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
@@ -578,6 +1581,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+        if (ggml_cuda_mem_trace_enabled()) {
+            ggml_cuda_mem_trace_line("pool_free_evict dev=%d stream=%d size=%.2f MiB cached_now=%.2f MiB",
+                                     device, stream_no, (double) size / 1048576.0, (double) pool_size / 1048576.0);
+        }
     }
 };
 
@@ -596,13 +1603,25 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
 #endif
 
-    explicit ggml_cuda_pool_vmm(int device) :
+    int stream_no = -1;
+    size_t peak_size = 0;
+
+    explicit ggml_cuda_pool_vmm(int device, int stream_no = -1) :
         device(device),
         physical_device(ggml_cuda_get_physical_device(device)),
-        granularity(ggml_cuda_info().devices[device].vmm_granularity) {
+        granularity(ggml_cuda_info().devices[device].vmm_granularity),
+        stream_no(stream_no) {
+        ggml_cuda_mem_trace_register_pool(this, device, stream_no);
+        ggml_cuda_mem_trace_line("pool_create dev=%d stream=%d type=vmm", device, stream_no);
+    }
+
+    void stats(size_t & cached, size_t & peak) const override {
+        cached = pool_size - pool_used;
+        peak   = peak_size;
     }
 
     ~ggml_cuda_pool_vmm() {
+        ggml_cuda_mem_trace_unregister_pool(this);
         if (pool_addr != 0) {
 #if defined(GGML_USE_HIP)
             // Workaround for https://github.com/ROCm/ROCR-Runtime/issues/285
@@ -700,6 +1719,13 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             // add to the pool
             pool_size += reserve_size;
+            peak_size = std::max(peak_size, pool_size);
+            if (ggml_cuda_mem_trace_enabled() && reserve_size >= ggml_cuda_mem_trace_min_bytes()) {
+                ggml_cuda_mem_trace_line("pool_vmm_grow dev=%d stream=%d node=%s reserve=%.2f MiB pool_size=%.2f MiB free=%.2f MiB",
+                                         device, stream_no, g_mem_trace_node,
+                                         (double) reserve_size / 1048576.0, (double) pool_size / 1048576.0,
+                                         (double) ggml_cuda_mem_trace_free(device) / 1048576.0);
+            }
 
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //       device, (unsigned long long) (pool_size/1024/1024),
@@ -736,10 +1762,10 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
                                                                                [[maybe_unused]] int stream_no) {
 #if defined(GGML_USE_VMM)
     if (ggml_cuda_info().devices[device].vmm) {
-        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
+        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device, stream_no));
     }
 #endif // defined(GGML_USE_VMM)
-    return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device));
+    return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device, stream_no));
 }
 
 // destroying a cuBLAS handle while a graph is being captured in a different thread can result in a CUDA error
@@ -785,6 +1811,9 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        if (ggml_cuda_mem_trace_enabled()) {
+            ggml_cuda_mem_trace_line("cuda_buffer_free dev=%d name=%s ptr=%p", device, name.c_str(), dev_ptr);
+        }
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -940,12 +1969,18 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_cuda_set_device(buft_ctx->device);
 
     void * dev_ptr;
+    const size_t free_before = ggml_cuda_mem_trace_free(buft_ctx->device);
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
         GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
         return nullptr;
+    }
+    if (ggml_cuda_mem_trace_enabled() && size >= ggml_cuda_mem_trace_min_bytes()) {
+        ggml_cuda_mem_trace_line("cuda_buffer_alloc dev=%d size=%.2f MiB free_before=%.2f MiB free_after=%.2f MiB",
+                                 buft_ctx->device, (double) size / 1048576.0, (double) free_before / 1048576.0,
+                                 (double) ggml_cuda_mem_trace_free(buft_ctx->device) / 1048576.0);
     }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
@@ -1774,6 +2809,11 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
+    if ((ffn_up->src[0] && ggml_exl3_bits(ffn_up->src[0]->type) > 0) ||
+        (ffn_gate->src[0] && ggml_exl3_bits(ffn_gate->src[0]->type) > 0)) {
+        return false;
+    }
+
     if (has_bias && (!ffn_up_bias || !ffn_gate_bias)) {
         return false;
     }
@@ -1863,6 +2903,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (ggml_exl3_bits(src0->type) > 0) {
+        return false;
+    }
+
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -1890,6 +2934,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+
+    if (ggml_exl3_bits(src0->type) > 0) {
+        return false;
+    }
 
     if (ggml_cuda_prefer_mmq()) {
         if (ggml_cuda_mm_route_enabled() && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
@@ -2198,10 +3246,362 @@ static bool ggml_cuda_int8_ffn_try(ggml_backend_cuda_context & ctx, const ggml_t
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// R3-5 step 1: int8-prefill emulation for the quality gate (dev/int8-prefill-gate.md). Opt-in, default off:
+// with LLAMA_FAKE_INT8_PREFILL unset this costs one getenv and returns, and no kernel below runs.
+//
+//   1 = both operands rotated (Hadamard blocks of 128 along K) and rounded to int8, codes kept in f16
+//   2 = control: the same f16 GEMM route, no rotation and no int8 rounding (the route's own noise floor)
+//   3 = as 1, but only for K <= LLAMA_FAKE_INT8_KMAX (default 6144), so ffn_down (K = 17408) stays on MMQ
+//   4 = diagnostic only: both operands rotated but kept in f16, no int8 grid (a numerically harmless change)
+//
+// Only matmuls with more than 64 columns are touched (prefill ubatches); decode and verify (n <= 64) keep
+// production numerics unconditionally. The GEMM runs on the integer codes with CUBLAS_COMPUTE_32F: the codes are
+// exact in f16 (|q| <= 127) and every product is exact in f32 (<= 16129), so this reproduces an int8 GEMM up to
+// f32 sum rounding; the per-row / per-token scales are applied in the epilogue, like an int8 GEMM epilogue.
+// Coverage and the per-matmul route land in FQROUTE lines (print when GGML_MM_ROUTE is set).
+// LLAMA_FAKE_INT8_ERRLOG=1 + LLAMA_FAKE_INT8_ERR_TENSORS=<names>: unit check of the kernels - for the first
+// occurrence of each named tensor the relative error of the emulated route and of MMQ against the same-matmul
+// f16 reference (what tests/int8_gate.py computes offline as both+fwht and prod_ref).
+// ---------------------------------------------------------------------------------------------
+static int ggml_cuda_fakeq_mode(void) {
+    static const int mode = [] {
+        const char * e = getenv("LLAMA_FAKE_INT8_PREFILL");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    return mode;
+}
+
+struct ggml_cuda_fakeq_cov {
+    int64_t total       = 0;   // n*K of every prefill matmul seen
+    int64_t hooked      = 0;   // n*K that took the emulated route
+    int64_t calls       = 0;
+    int64_t calls_hooked = 0;
+    std::vector<std::string> seen;
+    std::vector<std::pair<std::string, int64_t>> skip_nk;   // n*K per not-emulated op
+    // per batch width (the phase proxy: the prefix prefill is n = ubatch, the scored teacher-forced blocks are
+    // n = --block): total n*K, hooked n*K and the call count, so "did the scoring phase pass the hook?" has a
+    // one-line answer.
+    struct by_n { int64_t n, total, hooked, calls; };
+    std::vector<by_n> per_n;
+    ~ggml_cuda_fakeq_cov() {
+        if (getenv("GGML_MM_ROUTE") == nullptr) {
+            return;
+        }
+        fprintf(stderr, "FQCOV mode=%d prefill_nK_total=%lld hooked=%lld (%.2f%%) matmuls=%lld hooked=%lld\n",
+                ggml_cuda_fakeq_mode(), (long long) total, (long long) hooked,
+                total > 0 ? 100.0 * (double) hooked / (double) total : 0.0,
+                (long long) calls, (long long) calls_hooked);
+        for (const by_n & e : per_n) {
+            fprintf(stderr, "FQCOV n=%-6lld nK=%14lld hooked=%14lld (%6.2f%%) calls=%lld\n",
+                    (long long) e.n, (long long) e.total, (long long) e.hooked,
+                    e.total > 0 ? 100.0 * (double) e.hooked / (double) e.total : 0.0, (long long) e.calls);
+        }
+        for (const auto & kv : skip_nk) {
+            fprintf(stderr, "FQCOV skip %-52s nK=%lld (%.3f%%)\n", kv.first.c_str(), (long long) kv.second,
+                    total > 0 ? 100.0 * (double) kv.second / (double) total : 0.0);
+        }
+        fflush(stderr);
+    }
+    // every mul_mat call, whatever its batch width (the per-n table is the phase breakdown)
+    void note_any(const ggml_tensor * src0, const ggml_tensor * src1, bool hooked) {
+        const int64_t nK = src1->ne[1] * src0->ne[0];
+        const int64_t n  = src1->ne[1];
+        std::vector<by_n>::iterator it = per_n.begin();
+        while (it != per_n.end() && it->n != n) {
+            ++it;
+        }
+        if (it == per_n.end()) {
+            per_n.push_back({n, 0, 0, 0});
+            it = per_n.end() - 1;
+        }
+        it->total += nK;
+        ++it->calls;
+        if (hooked) {
+            it->hooked += nK;
+        }
+    }
+    void note(const ggml_tensor * src0, const ggml_tensor * src1, const char * why) {
+        const int64_t nK = src1->ne[1] * src0->ne[0];
+        total += nK;
+        ++calls;
+        note_any(src0, src1, why == nullptr);
+        if (why == nullptr) {
+            hooked += nK;
+            ++calls_hooked;
+        } else {
+            char key[256];
+            snprintf(key, sizeof(key), "%s (K=%lld, %s)", src0->name, (long long) src0->ne[0], why);
+            bool found = false;
+            for (auto & kv : skip_nk) {
+                if (kv.first == key) {
+                    kv.second += nK;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                skip_nk.push_back({key, nK});
+            }
+        }
+        if (getenv("GGML_MM_ROUTE") == nullptr) {
+            return;
+        }
+        char buf[512];
+        snprintf(buf, sizeof(buf), "FQROUTE n=%lld K=%lld M=%lld name=%s path=%s%s%s",
+                 (long long) src1->ne[1], (long long) src0->ne[0], (long long) src0->ne[1], src0->name,
+                 why == nullptr ? (ggml_cuda_fakeq_mode() == 2 ? "fakeq-f16" :
+                                       (ggml_cuda_fakeq_mode() == 4 ? "fakeq-rot-only" : "fakeq-int8"))
+                                 : "skip",
+                 why != nullptr ? " reason=" : "", why != nullptr ? why : "");
+        for (const std::string & s : seen) {
+            if (s == buf) {
+                return;
+            }
+        }
+        seen.push_back(buf);
+        fprintf(stderr, "%s\n", buf);
+        fflush(stderr);
+    }
+};
+
+static bool ggml_cuda_fakeq_errlog(const ggml_tensor * src0) {
+    static const bool on = getenv("LLAMA_FAKE_INT8_ERRLOG") != nullptr;
+    if (!on) {
+        return false;
+    }
+    static const std::string names = [] {
+        const char * e = getenv("LLAMA_FAKE_INT8_ERR_TENSORS");
+        return e != nullptr ? std::string(",") + e + "," : std::string();
+    }();
+    static std::vector<std::string> done;
+    const std::string nm = src0->name;
+    if (names.find("," + nm + ",") == std::string::npos) {
+        return false;
+    }
+    for (const std::string & s : done) {
+        if (s == nm) {
+            return false;
+        }
+    }
+    done.push_back(nm);
+    return true;
+}
+
+static bool ggml_cuda_mul_mat_fakeq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                    const ggml_tensor * src1, ggml_tensor * dst) {
+    const int mode = ggml_cuda_fakeq_mode();
+    if (mode <= 0) {
+        return false;
+    }
+    static ggml_cuda_fakeq_cov cov;
+    const int64_t N = src1->ne[1];
+    if (N <= 64) {
+        cov.note_any(src0, src1, false);   // decode / verify / teacher-forced scoring: never emulated
+        return false;
+    }
+
+    static const bool kmax_set = getenv("LLAMA_FAKE_INT8_KMAX") != nullptr;
+    static const int64_t kmax = [] {
+        const char * e = getenv("LLAMA_FAKE_INT8_KMAX");
+        return e != nullptr ? atoll(e) : (int64_t) 6144;
+    }();
+    static const int64_t max_w_bytes = [] {
+        const char * e = getenv("LLAMA_FAKE_INT8_MAX_MIB");
+        return (e != nullptr ? atoll(e) : (int64_t) 600) * 1024 * 1024;
+    }();
+    static const int64_t kmin = [] {
+        const char * e = getenv("LLAMA_FAKE_INT8_KMIN");
+        return e != nullptr ? atoll(e) : (int64_t) 0;
+    }();
+    static const int64_t err_cols = [] {
+        const char * e = getenv("LLAMA_FAKE_INT8_ERR_COLS");
+        return e != nullptr ? atoll(e) : (int64_t) 8;
+    }();
+
+    const int64_t K = src0->ne[0];
+    const int64_t M = src0->ne[1];
+
+    const char * why = nullptr;
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        why = "not-f32";
+    } else if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+               dst->ne[2] != 1 || dst->ne[3] != 1) {
+        why = "batched";
+    } else if (K % FQ_BLK != 0) {
+        why = "k-not-multiple-of-128";
+    } else if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        why = "not-contiguous";
+    } else if (ggml_get_to_fp16_cuda(src0->type) == nullptr) {
+        why = "no-f16-dequantiser";
+    } else if ((mode == 3 || kmax_set) && K > kmax) {
+        why = "k-above-kmax";
+    } else if (K < kmin) {
+        why = "k-below-kmin";
+    } else if (K * M * 2 > max_w_bytes) {
+        why = "weight-copy-above-max-mib";
+    }
+    cov.note(src0, src1, why);
+    if (why != nullptr) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<half>  buf_w(ctx.pool(), (size_t) K * M);
+    ggml_cuda_pool_alloc<half>  buf_x(ctx.pool(), (size_t) K * N);
+    ggml_cuda_pool_alloc<float> buf_ws(ctx.pool(), (size_t) M);
+    ggml_cuda_pool_alloc<float> buf_xs(ctx.pool(), (size_t) N);
+
+    auto dequant_w = [&]() {
+        const auto cv = ggml_get_to_fp16_cuda(src0->type);
+        cv(src0->data, buf_w.get(), K * M, stream);
+    };
+    auto cvt_x = [&]() {
+        ggml_cuda_fakeq_cvt_f16((const float *) src1->data, buf_x.get(), K * N, stream);
+    };
+    auto gemm = [&](const void * w, const void * x, float * out) {
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, (int) M, (int) N, (int) K,
+                                  &alpha, w, CUDA_R_16F, (int) K, x, CUDA_R_16F, (int) K, &beta, out,
+                                  CUDA_R_32F, (int) M, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    };
+
+    // unit check: the same matmul on the same operands with only the f16 GEMM route (the "exact" reference)
+    const bool check = ggml_cuda_fakeq_errlog(src0);
+    std::vector<float> h_ref, h_mmq;
+    static const char * err_dump = getenv("LLAMA_FAKE_INT8_ERR_DUMP");
+    static const int64_t err_rows = [] {
+        const char * e = getenv("LLAMA_FAKE_INT8_ERR_ROWS");
+        return e != nullptr ? atoll(e) : (int64_t) 128;
+    }();
+    auto dump_f16 = [&](const half * buf, int64_t rows, int64_t cols, const char * tag) {
+        if (err_dump == nullptr) {
+            return;
+        }
+        std::vector<half> h((size_t) rows * cols);
+        for (int64_t r = 0; r < rows; ++r) {
+            CUDA_CHECK(cudaMemcpy(h.data() + (size_t) r * cols, buf + r * K, sizeof(half) * cols,
+                                  cudaMemcpyDeviceToHost));
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/fq_%s_%s.bin", err_dump, tag, src0->name);
+        FILE * f = fopen(path, "wb");
+        if (f != nullptr) {
+            const int32_t hdr[3] = { (int32_t) cols, (int32_t) rows, 0 };
+            fwrite(hdr, sizeof(int32_t), 3, f);
+            fwrite(h.data(), sizeof(half), h.size(), f);
+            fclose(f);
+            fprintf(stderr, "FQDUMP %s rows=%lld cols=%lld\n", path, (long long) rows, (long long) cols);
+            fflush(stderr);
+        }
+    };
+    if (check) {
+        ggml_cuda_pool_alloc<float> buf_ref(ctx.pool(), (size_t) M * N);
+        dequant_w();
+        cvt_x();
+        if (err_dump != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            dump_f16(buf_w.get(), err_rows, K, "wpre");
+            dump_f16(buf_x.get(), err_cols, K, "xpre");
+        }
+        gemm(buf_w.get(), buf_x.get(), buf_ref.get());
+        // production MMQ on the unmodified operands, when MMQ has a case for this type
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        ggml_cuda_pool_alloc<float> buf_mmq(ctx.pool(), (size_t) M * N);
+        const bool have_mmq = ggml_cuda_should_use_mmq(src0->type, cc, N, 0);
+        ggml_tensor dtmp = *dst;
+        dtmp.data = buf_mmq.get();
+        if (have_mmq) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, &dtmp);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        h_ref.resize((size_t) err_rows * err_cols);
+        h_mmq.resize(have_mmq ? (size_t) err_rows * err_cols : 0);
+        for (int64_t c = 0; c < err_cols; ++c) {
+            CUDA_CHECK(cudaMemcpy(h_ref.data() + c * err_rows, buf_ref.get() + c * M, sizeof(float) * err_rows,
+                                  cudaMemcpyDeviceToHost));
+            if (have_mmq) {
+                CUDA_CHECK(cudaMemcpy(h_mmq.data() + c * err_rows, buf_mmq.get() + c * M, sizeof(float) * err_rows,
+                                      cudaMemcpyDeviceToHost));
+            }
+        }
+    }
+
+    dequant_w();
+    if (mode == 2) {
+        cvt_x();
+    } else {
+        // mode 4: rotate both operands but keep them in f16 (no int8 grid) - a diagnostic control for the
+        // question "is the gate sensitive to a numerically harmless prefill change?"
+        const bool quantize = mode != 4;
+        ggml_cuda_fakeq_rows_f16(buf_w.get(), M, K, buf_ws.get(), quantize, stream);
+        ggml_cuda_fakeq_cols_f16((const float *) src1->data, buf_x.get(), N, K, buf_xs.get(), quantize, stream);
+    }
+    gemm(buf_w.get(), buf_x.get(), (float *) dst->data);
+    if (mode != 2 && mode != 4) {
+        ggml_cuda_fakeq_epilogue((float *) dst->data, buf_ws.get(), buf_xs.get(), M, N, stream);
+    }
+
+    if (check) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (err_dump != nullptr) {
+            dump_f16(buf_w.get(), err_rows, K, "wq");
+            dump_f16(buf_x.get(), err_cols, K, "xq");
+            std::vector<float> hs((size_t) M + N);
+            CUDA_CHECK(cudaMemcpy(hs.data(), buf_ws.get(), sizeof(float) * M, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hs.data() + M, buf_xs.get(), sizeof(float) * N, cudaMemcpyDeviceToHost));
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/fq_s_%s.bin", err_dump, src0->name);
+            FILE * f = fopen(path, "wb");
+            if (f != nullptr) {
+                fwrite(hs.data(), sizeof(float), hs.size(), f);
+                fclose(f);
+            }
+        }
+        std::vector<float> h_q((size_t) err_rows * err_cols);
+        for (int64_t c = 0; c < err_cols; ++c) {
+            CUDA_CHECK(cudaMemcpy(h_q.data() + c * err_rows, (const float *) dst->data + c * M,
+                                  sizeof(float) * err_rows, cudaMemcpyDeviceToHost));
+        }
+        auto rel = [&](const std::vector<float> & a, const std::vector<float> & b) {
+            double num = 0.0;
+            double den = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                const double d = (double) b[i] - (double) a[i];
+                num += d * d;
+                den += (double) a[i] * (double) a[i];
+            }
+            return den > 0.0 ? std::sqrt(num / den) : 0.0;
+        };
+        fprintf(stderr, "FQERR name=%s K=%lld M=%lld n=%lld rows=%lld cols=%lld rel_route_vs_f16route=%.5f\n",
+                src0->name, (long long) K, (long long) M, (long long) N, (long long) err_rows, (long long) err_cols,
+                rel(h_ref, h_q));
+        if (!h_mmq.empty()) {
+            fprintf(stderr, "FQERR name=%s rel_mmq_vs_f16route=%.5f\n", src0->name, rel(h_ref, h_mmq));
+        }
+        fflush(stderr);
+    }
+
+    return true;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // EXL3 weights have their own kernels and never take any of the routes below
+    if (ggml_exl3_bits(src0->type) > 0) {
+        GGML_ASSERT(dst->src[0] == src0 && dst->src[1] == src1);
+        ggml_cuda_mul_mat_exl3(ctx, dst);
+        return;
+    }
+
     if (ggml_cuda_int8_ffn_try(ctx, src0, src1, dst)) {
+        return;
+    }
+
+    if (ggml_cuda_mul_mat_fakeq(ctx, src0, src1, dst)) {
         return;
     }
 
@@ -2221,6 +3621,45 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    // KV-scratch exact wide checks (opt-in GGML_CUDA_MMQ_INVARIANT, read per call): every column of a batch wider than
+    // 8 must come out exactly as it would in a batch of at most 8. Quantized types that MMQ handles at both widths
+    // stay one launch (MMQ uses a fixed 8-column tile and no stream-k in this mode, see mmq.cu). Every other route
+    // (BF16/F32 weights: mmvf/mmf vs cuBLAS; IQ1_M: no MMQ kernel, MMVQ vs cuBLAS) changes kernel with the width, so
+    // run it as consecutive slices of 8 columns through this same dispatcher, which then takes the <= 8 route.
+    if (ne11 > 8 && ne11 <= 256 && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1 &&
+            ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        const char * inv = getenv("GGML_CUDA_MMQ_INVARIANT");
+        const bool inv_on = inv != nullptr && inv[0] != '\0' && strcmp(inv, "0") != 0;
+        // opt-in LLAMA_MM_FLOAT_SLICE8=1: only the unquantized-weight products (e.g. the BF16 ssm_alpha / ssm_beta of
+        // Qwen3.5-family GDN layers: mmvf at <= 8 columns, mmf/cuBLAS above) take the 8-column slices; quantized types
+        // are left to their own kernels (with LLAMA_MMQ_IQ_DIRECT=1 they are width-invariant on their own), so a
+        // 16-token verify computes every column like a 1-token decode
+        static const bool fslice = [] {
+            const char * e = getenv("LLAMA_MM_FLOAT_SLICE8");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (inv_on || (fslice && !ggml_is_quantized(src0->type))) {
+            const bool one_mmq_launch = inv_on && ggml_is_quantized(src0->type) && ggml_cuda_prefer_mmq() &&
+                    ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0) &&
+                    ggml_cuda_should_use_mmq(src0->type, cc, 8, /*n_experts =*/ 0);
+            if (!one_mmq_launch) {
+                for (int64_t c0 = 0; c0 < ne11; c0 += 8) {
+                    ggml_tensor s1 = *src1;
+                    ggml_tensor d  = *dst;
+                    s1.ne[1] = d.ne[1] = std::min<int64_t>(8, ne11 - c0);
+                    s1.data  = (char *) src1->data + c0 * src1->nb[1];
+                    d.data   = (char *) dst->data  + c0 * dst->nb[1];
+                    for (int i = 2; i < GGML_MAX_DIMS; ++i) {
+                        s1.nb[i] = s1.nb[i - 1] * s1.ne[i - 1];
+                        d.nb[i]  = d.nb[i - 1]  * d.ne[i - 1];
+                    }
+                    ggml_cuda_mul_mat(ctx, src0, &s1, &d);
+                }
+                return;
+            }
+        }
+    }
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
@@ -2929,6 +4368,40 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_rms_norm_back(ctx, dst);
             break;
         case GGML_OP_MUL_MAT: {
+            // R3-5 step 1 (offline quality gate): dump the f32 activations of named matmuls, opt-in, default off.
+            // LLAMA_ACT_DUMP=<dir> + LLAMA_ACT_DUMP_NAMES="a,b,c" + LLAMA_ACT_DUMP_ROWS=N. One file per name, the
+            // first N columns of src[1] (K x N, column-major as in ggml: row r = value r of the K dimension).
+            if (getenv("LLAMA_ACT_DUMP") != nullptr && dst->src[1]->ne[1] >= 64 && dst->src[1]->type == GGML_TYPE_F32) {
+                static const char * dump_dir = getenv("LLAMA_ACT_DUMP");
+                static const char * dump_names = getenv("LLAMA_ACT_DUMP_NAMES");
+                static const int dump_rows = getenv("LLAMA_ACT_DUMP_ROWS") != nullptr
+                                                 ? atoi(getenv("LLAMA_ACT_DUMP_ROWS")) : 8;
+                static std::vector<std::string> done;
+                std::string nm = dst->src[0]->name;
+                if (dump_names != nullptr && nm.find(".") != std::string::npos &&
+                        std::string(",").append(dump_names).append(",").find("," + nm + ",") != std::string::npos &&
+                        std::find(done.begin(), done.end(), nm) == done.end()) {
+                    done.push_back(nm);
+                    std::vector<float> host((size_t) dst->src[1]->ne[0] * dump_rows);
+                    const size_t row_bytes = (size_t) dst->src[1]->ne[0] * sizeof(float);
+                    for (int r = 0; r < dump_rows; ++r) {
+                        (void) cudaMemcpy(host.data() + (size_t) r * dst->src[1]->ne[0],
+                                          (const char *) dst->src[1]->data + (size_t) r * dst->src[1]->nb[1],
+                                          row_bytes, cudaMemcpyDeviceToHost);
+                    }
+                    std::string path = std::string(dump_dir) + "/act_" + nm + ".bin";
+                    FILE * fa = fopen(path.c_str(), "wb");
+                    if (fa != nullptr) {
+                        const int32_t hdr[3] = { (int32_t) dst->src[1]->ne[0], dump_rows, 0 };
+                        fwrite(hdr, sizeof(int32_t), 3, fa);
+                        fwrite(host.data(), sizeof(float), host.size(), fa);
+                        fclose(fa);
+                        fprintf(stderr, "[actdump] %s K=%lld rows=%d\n", nm.c_str(),
+                                (long long) dst->src[1]->ne[0], dump_rows);
+                        fflush(stderr);
+                    }
+                }
+            }
             static const bool t_mm = getenv("GGML_MM_TIMING") != nullptr;
             ggml_cuda_mm_input_stats(ctx, dst);
             // T1 instrumentation: GGML_MM_TIMING now times decode-sized batches (n <= 8); prefill stays untimed
@@ -3313,6 +4786,20 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    // Opt-in (LLAMA_GRAPH_KEY_NTOK=1): include the batch width in the key. With speculative decoding the verify
+    // batch alternates between widths (n_max+1 and the length of a shorter draft), and because the key was only
+    // the first node, both widths shared one ggml_cuda_graph and kept overwriting each other's node_props. Every
+    // width change then looked like a property change -> warmup reset -> two uncaptured steps -> a re-capture.
+    // Measured before the fix: 7 captures of 24-70 ms in 96 decode steps (probe D).
+    static const bool key_ntok = [] {
+        const char * e = getenv("LLAMA_GRAPH_KEY_NTOK");
+        return e != nullptr && e[0] != 0 && atoi(e) != 0;
+    }();
+    if (key_ntok && cgraph->n_nodes > 0) {
+        const uintptr_t p = (uintptr_t) cgraph->nodes[0];
+        const uintptr_t w = (uintptr_t) std::max<int64_t>(1, cgraph->nodes[0]->ne[1]);
+        return (const void *) (p ^ (w * 0x9e3779b97f4a7c15ull));
+    }
     return cgraph->nodes[0];
 }
 
@@ -3352,6 +4839,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // Opt-in (LLAMA_GRAPH_RECAP_LOG=1): name the reason the graph is judged changed, so a re-capture
+            // can be attributed instead of guessed at.
+            static const bool recap_log = [] {
+                const char * e = getenv("LLAMA_GRAPH_RECAP_LOG");
+                return e != nullptr && e[0] != 0 && atoi(e) != 0;
+            }();
+            if (recap_log && !res && i < (int) graph->node_props.size()) {
+                const ggml_cuda_graph::node_properties & old_p = graph->node_props[i];
+                const char * why = "other";
+                if (old_p.node.op != prop.node.op) why = "op";
+                else if (memcmp(old_p.node.ne, prop.node.ne, sizeof(prop.node.ne)) != 0) why = "ne";
+                else if (memcmp(old_p.node.nb, prop.node.nb, sizeof(prop.node.nb)) != 0) why = "nb";
+                else if (memcmp(old_p.node_src_ne, prop.node_src_ne, sizeof(prop.node_src_ne)) != 0) why = "src_ne";
+                else if (memcmp(old_p.node_src_data_ptrs, prop.node_src_data_ptrs, sizeof(prop.node_src_data_ptrs)) != 0) why = "src_ptr";
+                int jdiff = -1;
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (old_p.node_src_data_ptrs[j] != prop.node_src_data_ptrs[j]) { jdiff = j; break; }
+                }
+                fprintf(stderr, "[recap] node %d/%d op=%s why=%s src=%d first_src_diff=%d\n",
+                        i, cgraph->n_nodes, ggml_op_name(prop.node.op), why, jdiff, jdiff);
+                fflush(stderr);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -5217,12 +6726,63 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             ggml_cuda_kv_plan kv_plan(cgraph);
+            // read once per eval, not per node (the per-node getenv cost ~5 ms per decode step)
+            const bool w_stage_m2 = getenv("LLAMA_W_STAGE_ENABLE") != nullptr && getenv("LLAMA_W_STAGE_BLOCKS") != nullptr;
             const char * stage_dbg = getenv("LLAMA_KV_STAGE_TRACE");
             if (stage_dbg) { fprintf(stderr, "[stage] eval start use=%d upd=%d n_nodes=%d\n", use_cuda_graph, cuda_graph_update_required, cgraph->n_nodes); fflush(stderr); }
             kv_plan.begin(*cuda_ctx);
+            g_op_prof.mark(cuda_ctx->stream(), OPP_GAP);   // eval start (GGML_OP_PROF)
             if (stage_dbg) { fprintf(stderr, "[stage] begin done layers=%zu slots=%d\n", kv_plan.layers.size(), kv_plan.staging ? kv_plan.staging->n_slots : -1); fflush(stderr); }
+            // R2-5c Stage 0 guard print (opt-in LLAMA_FA_NODE_TRACE=1): every FLASH_ATTN_EXT node in the eval
+            // graph, before the fusion skip, with every condition the hot/sentinel probe needs. Default: off.
+            {
+                static const bool fa_trace = getenv("LLAMA_FA_NODE_TRACE") != nullptr;
+                if (fa_trace) {
+                    int n_fa = 0;
+                    int n_ok = 0;
+                    for (int k = 0; k < cgraph->n_nodes; k++) {
+                        const ggml_tensor * nd = cgraph->nodes[k];
+                        if (nd->op != GGML_OP_FLASH_ATTN_EXT) {
+                            continue;
+                        }
+                        const bool k_ok  = nd->src[1] != nullptr;
+                        const bool m_ok  = nd->src[3] != nullptr;
+                        const bool q_ok  = nd->src[0] != nullptr && nd->src[0]->ne[0] == 256;
+                        const bool guard = k_ok && m_ok && q_ok;
+                        n_fa++;
+                        n_ok += guard ? 1 : 0;
+                        fprintf(stderr, "[fa] k=%d %s q_ne0=%lld n_q=%lld n_kv=%lld k=%d mask=%d hq=%lld hkv=%lld",
+                                k, guard ? "GUARD" : "skip ",
+                                (long long) (nd->src[0] ? nd->src[0]->ne[0] : -1),
+                                (long long) (nd->src[0] ? nd->src[0]->ne[1] : -1),
+                                (long long) (nd->src[1] ? nd->src[1]->ne[1] : -1),
+                                (int) k_ok, (int) m_ok,
+                                (long long) (nd->src[0] ? nd->src[0]->ne[2] : -1),
+                                (long long) (nd->src[1] ? nd->src[1]->ne[2] : -1));
+                        fputc(10, stderr);
+                    }
+                    fprintf(stderr, "[fa] eval: FA nodes=%d guard_ok=%d n_nodes=%d", n_fa, n_ok, cgraph->n_nodes);
+                    fputc(10, stderr);
+                    fflush(stderr);
+                }
+            }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                {
+                    // R2-5c Stage 0: which FA nodes the execution loop actually visits (fusion may skip them)
+                    static const bool fa_visit = getenv("LLAMA_FA_NODE_TRACE") != nullptr;
+                    if (fa_visit && node->op == GGML_OP_FLASH_ATTN_EXT) {
+                        fprintf(stderr, "[fal] visit i=%d dir=%d k=%d mask=%d ne0=%lld stage=%d", i,
+                                (int) (g_hot_dir != nullptr), (int) (node->src[1] != nullptr),
+                                (int) (node->src[3] != nullptr),
+                                (long long) (node->src[0] ? node->src[0]->ne[0] : -1),
+                                (int) (getenv("LLAMA_W_STAGE_ENABLE") != nullptr));
+                        fputc(10, stderr);
+                    }
+                }
+                if (ggml_cuda_mem_trace_enabled()) {
+                    g_mem_trace_node = node->name;
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -5263,6 +6823,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                g_op_prof.mark(cuda_ctx->stream(), OPP_GAP);
+                g_op_prof.note(node);
                 if (kv_plan.write(*cuda_ctx, node) || kv_plan.attention(*cuda_ctx, node)) {
                     continue;
                 }
@@ -5275,6 +6837,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = touches_staged_kv ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    g_op_prof.mark(cuda_ctx->stream(), ggml_cuda_op_prof_class(node));
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5301,19 +6864,43 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                if (getenv("LLAMA_W_STAGE_ENABLE") != nullptr && getenv("LLAMA_W_STAGE_BLOCKS") != nullptr) {
+                if (w_stage_m2) {
                     ggml_cuda_w_stage_m2_wait(cuda_ctx, node, cgraph, i);
                 }
+                // Opt-in stripped-model study hooks (LLAMA_STRIP_*): mask the matmul input before the op
+                // runs (FFN groups / attention / GDN heads) and the logits after the output head ran.
+                ggml_cuda_strip_pre(*cuda_ctx, node);
+
+                // R2-5c Stage 0: state of the hot guard at the moment it is evaluated
+                {
+                    static const bool fa_hot_dbg = getenv("LLAMA_FA_NODE_TRACE") != nullptr;
+                    if (fa_hot_dbg && node->op == GGML_OP_FLASH_ATTN_EXT) {
+                        fprintf(stderr, "[fah] i=%d dir=%d k=%d mask=%d ne0=%lld hl=%d viewnoop=%d",
+                                i, (int) (g_hot_dir != nullptr),
+                                (int) (node->src[1] != nullptr), (int) (node->src[3] != nullptr),
+                                (long long) (node->src[0] ? node->src[0]->ne[0] : -1), g_hot_layer,
+                                (int) ggml_cuda_is_view_or_noop(node));
+                        fputc(10, stderr);
+                    }
+                }
+                hot_done:;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                ggml_cuda_strip_post(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                g_op_prof.mark(cuda_ctx->stream(), ggml_cuda_op_prof_class(node));
+                // Run the opt-in probe after the consumer kernel. This keeps its side work out of the
+                // attention launch path and prevents it from changing F's scheduling or resource use.
+                ggml_cuda_hot_probe_node(*cuda_ctx, node);
+                g_op_prof.mark(cuda_ctx->stream(), OPP_PROBE);
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
             }
+            g_op_prof.flush(cuda_ctx->stream(), cgraph->n_nodes);
             kv_plan.end(*cuda_ctx);
         }
 
@@ -5449,6 +7036,9 @@ static bool ggml_cuda_w_stage_wanted(const char * name) {
         return false;
     }
     if (strncmp(name, "blk.", 4) != 0) {
+        return false;
+    }
+    if (strstr(name, ".exl3_") != nullptr) {
         return false;
     }
     const char * p = name + 4;
@@ -5968,6 +7558,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t back
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    cuda_ctx->mem_trace("eval_begin");
+    g_hot_layer = 0;
+
     // Allocate stable staging slots OUTSIDE capture; invalidate captured pointers
     // before resizing (e.g. a subsequent, larger context on the same backend).
     ggml_cuda_kv_plan kv_plan(cgraph);
@@ -5982,7 +7575,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t back
             nk = std::max(nk, ggml_nbytes(l.k)); nv = std::max(nv, ggml_nbytes(l.v));
         }
         if (stage_dbg) { fprintf(stderr, "[stage] reserve nk=%zu nv=%zu\n", nk, nv); fflush(stderr); }
-        if (cuda_ctx->kv_staging->reserve(nk, nv)) {
+        bool resized = false;
+        if (cuda_ctx->kv_staging->elastic) {
+            size_t row_k = 0, row_v = 0, rows = 0;
+            for (const auto & l : kv_plan.layers) {
+                row_k = std::max(row_k, (size_t) l.k->nb[1]); row_v = std::max(row_v, (size_t) l.v->nb[1]);
+                rows  = std::max(rows, l.nk / (size_t) l.k->nb[1]);
+            }
+            resized = cuda_ctx->kv_staging->reserve_elastic(kv_plan.layers.size(), row_k, row_v, rows);
+        } else {
+            resized = cuda_ctx->kv_staging->reserve(nk, nv);
+        }
+        if (resized) {
 #ifdef USE_CUDA_GRAPH
             cuda_ctx->cuda_graphs.clear();
 #endif
@@ -6000,7 +7604,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t back
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     // Staged KV never captures: its slot-reuse events outlive one eval, and an
     // event recorded inside a capture cannot be waited on outside it again.
-    if (kv_plan.layers.empty()) {
+    // opt-in LLAMA_KV_STAGE_GRAPHS=1: an elastic eval with every layer in a valid sticky slot uses no staging events
+    const bool staged_graph = !kv_plan.layers.empty() && kv_plan.graph_ok(cuda_ctx->kv_staging.get());
+    if (cuda_ctx->kv_staging) {
+        cuda_ctx->kv_staging->graph_mode = staged_graph;
+    }
+    if (kv_plan.layers.empty() || staged_graph) {
         ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
         if (graph->is_enabled()) {
             const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
@@ -6047,6 +7656,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t back
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    ggml_cuda_hot_end_eval();
+    ggml_cuda_hot_sent_end_eval();
+    cuda_ctx->mem_trace("eval_end");
 
     return GGML_STATUS_SUCCESS;
 }
@@ -6815,6 +8428,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
 #endif // GGML_USE_MUSA
+                if (ggml_exl3_bits(a->type) > 0) {
+                    // the matmul node carries suh / svh as src[2] / src[3]; buffer-type probes come without them
+                    const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                    return op->op == GGML_OP_MUL_MAT && b->type == GGML_TYPE_F32 &&
+                        GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
+                        (op->src[2] == nullptr || ggml_cuda_mul_mat_exl3_supported(op));
+                }
                 switch (a->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -7374,6 +8994,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_w_stage_adopt") == 0) {
         return (void *) ggml_cuda_w_stage_adopt;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_sent_page_scores") == 0) {
+        return (void *) ggml_backend_cuda_get_sent_page_scores;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_sent_page_scores_q") == 0) {
+        return (void *) ggml_backend_cuda_get_sent_page_scores_q;
     }
     return nullptr;
 }

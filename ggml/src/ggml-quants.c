@@ -5621,6 +5621,19 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
             } break;
+        case GGML_TYPE_EXL3_1:
+        case GGML_TYPE_EXL3_2:
+        case GGML_TYPE_EXL3_3:
+        case GGML_TYPE_EXL3_4:
+        case GGML_TYPE_EXL3_5:
+        case GGML_TYPE_EXL3_6:
+        case GGML_TYPE_EXL3_7:
+        case GGML_TYPE_EXL3_8:
+            {
+                // packed trellis bits, every bit pattern is valid
+                GGML_UNUSED(data);
+                GGML_UNUSED(nb);
+            } break;
 
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:

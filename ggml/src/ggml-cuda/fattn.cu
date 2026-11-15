@@ -6,6 +6,8 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <cstring>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
@@ -631,7 +633,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // opt-in q4_0 decode kernel (D=256, GQA 6, 1-8 query tokens), ahead of VEC; false unless LLAMA_FA_DECODE_Q4=1
+    // Opt-in q4_0 split-K decode attention, ahead of VEC (batch invariant up to 512 queries, see
+    // ggml_cuda_flash_attn_ext_invariant_split).
     if (ggml_cuda_fattn_decode_q4_supported(device, dst)) {
         return BEST_FATTN_KERNEL_DECODE_Q4;
     }
@@ -735,8 +738,58 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+// KV-scratch exact wide checks (opt-in GGML_CUDA_MMQ_INVARIANT, read per call): where the kernel choice depends on
+// the number of query tokens (VEC/MMA/tile), a query in a 33-wide batch would not be computed as in an 8-wide one.
+// Each query is independent in attention (the mask carries causality), so such a batch runs as consecutive slices of
+// at most 8 queries through this same dispatcher.
+static bool ggml_cuda_flash_attn_ext_invariant_split(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * mask = dst->src[3];
+    if (Q->ne[1] <= 8 || Q->ne[1] > 256 || Q->ne[3] != 1 || dst->ne[3] != 1 || dst->ne[2] != Q->ne[1]) {
+        return false;
+    }
+    const char * inv = getenv("GGML_CUDA_MMQ_INVARIANT");
+    if (inv == nullptr || inv[0] == '\0' || strcmp(inv, "0") == 0) {
+        return false;
+    }
+    // The split-K q4_0 decode kernel is batch invariant by construction (fixed split partition, per-row mma and a
+    // fixed softmax-sum order for every tile size; logit diff 0 at 33 and 129 wide) and takes up to 512 queries in
+    // one launch. Opt-in LLAMA_FA_INV_ONE_LAUNCH=1 uses that single launch; the slices stay the default because
+    // they measured faster at 180K (33-wide check: 410 vs 485 ms per cycle).
+    const char * one_launch = getenv("LLAMA_FA_INV_ONE_LAUNCH");
+    if (one_launch != nullptr && one_launch[0] != '\0' && strcmp(one_launch, "0") != 0 &&
+            ggml_cuda_fattn_decode_q4_supported(ggml_cuda_get_device(), dst)) {
+        return false;
+    }
+    for (int64_t i0 = 0; i0 < Q->ne[1]; i0 += 8) {
+        const int64_t n = std::min<int64_t>(8, Q->ne[1] - i0);
+        ggml_tensor q = *Q;
+        q.ne[1] = n;
+        q.data  = (char *) Q->data + i0 * Q->nb[1];
+        ggml_tensor m;
+        if (mask != nullptr) {
+            m = *mask;
+            m.ne[1] = mask->ne[1] - i0;              // rows from this slice's first query on (>= n)
+            m.data  = (char *) mask->data + i0 * mask->nb[1];
+            m.nb[2] = m.nb[1] * m.ne[1];
+            m.nb[3] = m.nb[2] * m.ne[2];
+        }
+        ggml_tensor node = *dst;                     // output [D_v, n_head, n_tokens, 1]: tokens on dim 2
+        node.ne[2]  = n;
+        node.data   = (char *) dst->data + i0 * dst->nb[2];
+        node.nb[3]  = node.nb[2] * node.ne[2];
+        node.src[0] = &q;
+        node.src[3] = mask != nullptr ? &m : nullptr;
+        ggml_cuda_flash_attn_ext(ctx, &node);
+    }
+    return true;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (ggml_cuda_flash_attn_ext_invariant_split(ctx, dst)) {
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

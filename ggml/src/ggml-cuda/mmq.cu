@@ -188,6 +188,8 @@ void ggml_cuda_mul_mat_q(
 
     int J_best        = 0;
     int nthreads_best = 0;
+    bool width_invariant = false;
+    bool invariant_free_j_outer = false;
     {
         int64_t ncols_opt = ne11;
         if (ids) {
@@ -201,26 +203,44 @@ void ggml_cuda_mul_mat_q(
             }
         }
 
-        int ntiles_J_best = INT_MAX;
-
-        for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
-            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
-            if (config.type == GGML_TYPE_COUNT) {
-                continue;
-            }
-
-            if (mmq_get_nbytes_shared(config, cc) > smpbo) {
-                continue;
-            }
-
-            const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
-
-            if (ntiles_x < ntiles_J_best) {
-                J_best = J;
+        const char * invariant_env = getenv("GGML_CUDA_MMQ_INVARIANT");
+        // GGML_CUDA_MMQ_INVARIANT=2: plain K tiling (no stream-k) but the usual column tile J, so a wide batch reads the
+        // weights once per J columns instead of once per 8 (valid if the per-element K order does not depend on J)
+        const bool invariant_free_j = invariant_env != nullptr && strcmp(invariant_env, "2") == 0 && ncols_opt <= 256;
+        invariant_free_j_outer = invariant_free_j;
+        if (!invariant_free_j && invariant_env != nullptr && invariant_env[0] != 0 && strcmp(invariant_env, "0") != 0 && ncols_opt <= 256) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, 8, fallback, cc, prec_src1);
+            if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+                J_best = 8;
                 nthreads_best = config.nthreads;
-                ntiles_J_best = ntiles_x;
+                width_invariant = true;
             }
         }
+
+        if (!width_invariant) {
+            int ntiles_J_best = INT_MAX;
+            for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+                const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
+                if (config.type == GGML_TYPE_COUNT) {
+                    continue;
+                }
+
+                if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+                    continue;
+                }
+
+                const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
+
+                if (ntiles_x < ntiles_J_best) {
+                    J_best = J;
+                    nthreads_best = config.nthreads;
+                    ntiles_J_best = ntiles_x;
+                }
+            }
+        }
+    }
+    if (invariant_free_j_outer) {
+        width_invariant = true;   // plain K tiling only
     }
     GGML_ASSERT(J_best > 0);
 
@@ -268,7 +288,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, J_best};
+            ne1, J_best, width_invariant};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
@@ -347,7 +367,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, J_best};
+        ne12, J_best, width_invariant};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

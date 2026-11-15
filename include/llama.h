@@ -802,6 +802,28 @@ extern "C" {
                  llama_pos p1,
                        int d);
 
+    // EXPERIMENTAL: replace ctx_dst's attention KV cache with cells from ctx_src whose absolute
+    // positions fall in the half-open ranges [ranges[2*i], ranges[2*i + 1]). The contexts must
+    // share the same model and use matching, non-transposed KV layouts. `ranges` may be NULL only
+    // when n_ranges is zero. Recurrent state is not copied by this function.
+    LLAMA_API bool llama_kv_scratch_copy(
+            struct llama_context * ctx_dst,
+            struct llama_context * ctx_src,
+                    llama_seq_id   seq_id,
+             const llama_pos *     ranges,
+                    size_t         n_ranges);
+
+    // EXPERIMENTAL: incremental llama_kv_scratch_copy. ctx_dst keeps the cells it already holds whose positions
+    // are still inside the ranges and below invalidate_from; every other cell is dropped, and only the missing
+    // positions are copied from ctx_src. Use invalidate_from = the first position ctx_dst wrote itself.
+    LLAMA_API bool llama_kv_scratch_update(
+            struct llama_context * ctx_dst,
+            struct llama_context * ctx_src,
+                    llama_seq_id   seq_id,
+             const llama_pos *     ranges,
+                    size_t         n_ranges,
+                    llama_pos      invalidate_from);
+
     // Returns the smallest position present in the memory for the specified sequence
     // This is typically non-zero only for SWA caches
     // Note that all positions in the range [pos_min, pos_max] are guaranteed to be present in the memory

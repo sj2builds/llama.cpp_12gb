@@ -357,11 +357,28 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // R2-5g item 1: per-layer KQ mask (opt-in). Falls back to the shared mask when not enabled.
+    ggml_tensor * get_kq_mask_l(int32_t il) const {
+        if (self_kq_mask_layers.empty()) {
+            return self_kq_mask_cnv;
+        }
+        for (size_t i = 0; i < layer_ids_kv.size(); ++i) {
+            if ((int32_t) layer_ids_kv[i] == il) {
+                return self_kq_mask_layers[i];
+            }
+        }
+        return self_kq_mask_cnv;
+    }
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // per-layer views of self_kq_mask_cnv, one per KV layer (empty = the shared single-plane mask)
+    std::vector<ggml_tensor *> self_kq_mask_layers;
+    std::vector<uint32_t>      layer_ids_kv;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;

@@ -701,6 +701,54 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
     },
+    [GGML_TYPE_EXL3_1] = {
+        .type_name                = "exl3_1",
+        .blck_size                = 256,      // one 16x16 trellis tile
+        .type_size                = 32 * 1,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_2] = {
+        .type_name                = "exl3_2",
+        .blck_size                = 256,      // one 16x16 trellis tile
+        .type_size                = 32 * 2,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_3] = {
+        .type_name                = "exl3_3",
+        .blck_size                = 256,      // one 16x16 trellis tile
+        .type_size                = 32 * 3,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_4] = {
+        .type_name                = "exl3_4",
+        .blck_size                = 256,      // one 16x16 trellis tile
+        .type_size                = 32 * 4,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_5] = {
+        .type_name                = "exl3_5",
+        .blck_size                = 256,      // one 16x16 trellis tile
+        .type_size                = 32 * 5,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_6] = {
+        .type_name                = "exl3_6",
+        .blck_size                = 256,      // one 16x16 trellis tile
+        .type_size                = 32 * 6,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_7] = {
+        .type_name                = "exl3_7",
+        .blck_size                = 256,      // one 16x16 trellis tile
+        .type_size                = 32 * 7,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_8] = {
+        .type_name                = "exl3_8",
+        .blck_size                = 256,      // one 16x16 trellis tile
+        .type_size                = 32 * 8,
+        .is_quantized             = true,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -1364,6 +1412,10 @@ const char * ggml_type_name(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
     return type_traits[type].type_name;
+}
+
+int ggml_exl3_bits(enum ggml_type type) {
+    return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3_8 ? (int) (type - GGML_TYPE_EXL3_1) + 1 : 0;
 }
 
 bool ggml_is_quantized(enum ggml_type type) {

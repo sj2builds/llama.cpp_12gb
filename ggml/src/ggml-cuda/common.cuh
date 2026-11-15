@@ -1197,11 +1197,25 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+// Opt-in CUDA memory tracing, enabled by LLAMA_CUDA_MEM_TRACE=1. Implemented in ggml-cuda.cu;
+// every helper below is a no-op (or returns 0) when the variable is unset, so the default path
+// behaves exactly as before.
+bool   ggml_cuda_mem_trace_enabled();
+// cudaMemGetInfo().free for the device, 0 when tracing is off.
+size_t ggml_cuda_mem_trace_free(int device);
+// One stderr line; no-op when tracing is off.
+void   ggml_cuda_mem_trace_line(const char * fmt, ...);
+// Free/total VRAM plus every live pool's cached and peak bytes.
+void   ggml_cuda_mem_trace_dump(int device, const char * tag);
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // Tracing only: `cached` = bytes the pool holds but is not using, `peak` = its high-water mark.
+    virtual void stats(size_t & cached, size_t & peak) const { cached = 0; peak = 0; }
 };
 
 template<typename T>
@@ -1536,6 +1550,7 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);
+            const size_t free_before = ggml_cuda_mem_trace_free(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
             CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
@@ -1547,6 +1562,12 @@ struct ggml_backend_cuda_context {
             CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
             CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
 #endif
+            if (ggml_cuda_mem_trace_enabled()) {
+                ggml_cuda_mem_trace_line("MEMTRACE cublas_create dev=%d stream=%d ws=%.2f MiB free_before=%.2f MiB free_after=%.2f MiB",
+                                         device, curr_stream_no, (double) cublas_workspace_sizes[device] / 1048576.0,
+                                         (double) free_before / 1048576.0,
+                                         (double) ggml_cuda_mem_trace_free(device) / 1048576.0);
+            }
         }
         return cublas_handles[device][curr_stream_no];
     }
@@ -1565,6 +1586,26 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_pool & pool() {
         return pool(device);
+    }
+
+    // LLAMA_CUDA_MEM_TRACE=1: dump the streams and cuBLAS handles that exist plus free VRAM and the
+    // state of every pool. No-op when the variable is unset.
+    void mem_trace(const char * tag) {
+        if (!ggml_cuda_mem_trace_enabled()) {
+            return;
+        }
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+            for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+                if (streams[d][s] == nullptr && cublas_handles[d][s] == nullptr) {
+                    continue;
+                }
+                ggml_cuda_mem_trace_line("%s dev=%d stream=%d cuda_stream=%s cublas_handle=%s cublas_ws=%.2f MiB",
+                                         tag, d, s, streams[d][s] ? "yes" : "no",
+                                         cublas_handles[d][s] ? "yes" : "no",
+                                         (double) (cublas_workspaces[d][s] != nullptr ? cublas_workspace_sizes[d] : 0) / 1048576.0);
+            }
+        }
+        ggml_cuda_mem_trace_dump(device, tag);
     }
 };
 

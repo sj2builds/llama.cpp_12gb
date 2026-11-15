@@ -2223,8 +2223,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             synchronize();
             kv_dump_done = true;
             const auto * kv = dynamic_cast<const llama_kv_cache *>(memory.get());
-            if (kv) kv->dump_files(dd);
-            else LLAMA_LOG_INFO("KV-DUMP: memory type = %s\n", typeid(*memory).name());
+            const auto * hyb = dynamic_cast<const llama_memory_hybrid *>(memory.get());
+            if (kv) {
+                kv->dump_files(dd);
+            } else if (hyb != nullptr && hyb->get_mem_attn() != nullptr) {
+                // a hybrid model (attention + recurrent layers) keeps its KV cache inside the hybrid memory
+                hyb->get_mem_attn()->dump_files(dd);
+            } else {
+                LLAMA_LOG_INFO("KV-DUMP: memory type = %s\n", typeid(*memory).name());
+            }
         }
     }
 
@@ -2765,7 +2772,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
-        /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.hdmd        =*/ model.hdmd.rot.empty() && model.hdmd.exl3.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4513,6 +4520,77 @@ void llama_memory_seq_div(
     }
 
     mem->seq_div(seq_id, p0, p1, d);
+}
+
+bool llama_kv_scratch_copy(
+        llama_context * ctx_dst,
+        llama_context * ctx_src,
+        llama_seq_id seq_id,
+        const llama_pos * ranges,
+        size_t n_ranges) {
+    if (!ctx_dst || !ctx_src || ctx_dst == ctx_src || seq_id < 0 || (n_ranges > 0 && !ranges)) {
+        return false;
+    }
+    auto get_cache = [](llama_context * ctx) -> llama_kv_cache * {
+        auto * mem = ctx->get_memory();
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            return hybrid->get_mem_attn();
+        }
+        return dynamic_cast<llama_kv_cache *>(mem);
+    };
+    auto * dst = get_cache(ctx_dst);
+    auto * src = get_cache(ctx_src);
+    if (!dst || !src) {
+        return false;
+    }
+    std::vector<std::pair<llama_pos, llama_pos>> rr;
+    rr.reserve(n_ranges);
+    for (size_t i = 0; i < n_ranges; ++i) {
+        if (ranges[2*i] < 0 || ranges[2*i + 1] < ranges[2*i]) {
+            return false;
+        }
+        if (ranges[2*i + 1] > ranges[2*i]) {
+            rr.emplace_back(ranges[2*i], ranges[2*i + 1]);
+        }
+    }
+    // Callers copy only after both contexts have completed their eval and made logits/state visible.
+    // Avoid scheduler-wide device synchronization here; tensor_get/set handle the actual range transfers.
+    return dst->copy_scratch_from(*src, seq_id, rr);
+}
+
+bool llama_kv_scratch_update(
+        llama_context * ctx_dst,
+        llama_context * ctx_src,
+        llama_seq_id seq_id,
+        const llama_pos * ranges,
+        size_t n_ranges,
+        llama_pos invalidate_from) {
+    if (!ctx_dst || !ctx_src || ctx_dst == ctx_src || seq_id < 0 || (n_ranges > 0 && !ranges)) {
+        return false;
+    }
+    auto get_cache = [](llama_context * ctx) -> llama_kv_cache * {
+        auto * mem = ctx->get_memory();
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            return hybrid->get_mem_attn();
+        }
+        return dynamic_cast<llama_kv_cache *>(mem);
+    };
+    auto * dst = get_cache(ctx_dst);
+    auto * src = get_cache(ctx_src);
+    if (!dst || !src) {
+        return false;
+    }
+    std::vector<std::pair<llama_pos, llama_pos>> rr;
+    rr.reserve(n_ranges);
+    for (size_t i = 0; i < n_ranges; ++i) {
+        if (ranges[2*i] < 0 || ranges[2*i + 1] < ranges[2*i]) {
+            return false;
+        }
+        if (ranges[2*i + 1] > ranges[2*i]) {
+            rr.emplace_back(ranges[2*i], ranges[2*i + 1]);
+        }
+    }
+    return dst->update_scratch_from(*src, seq_id, rr, invalidate_from);
 }
 
 llama_pos llama_memory_seq_pos_min(

@@ -73,6 +73,9 @@ struct llama_model_loader {
     int n_tensors = 0;
     int n_created = 0;
 
+    // EXL3 weight -> its sign/scale vectors (suh, svh), created next to the weight by create_tensor()
+    std::unordered_map<const ggml_tensor *, std::pair<ggml_tensor *, ggml_tensor *>> exl3_aux;
+
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
 

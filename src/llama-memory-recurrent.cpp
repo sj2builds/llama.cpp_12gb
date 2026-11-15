@@ -291,13 +291,20 @@ bool llama_memory_recurrent::replay(uint32_t cell, uint32_t m) {
     const int64_t t1 = ggml_time_us();
 
     bool ok = ggml_gallocr_alloc_graph(rpl_galloc, gf);
+    const int64_t t2 = ggml_time_us();
     if (ok) {
         ok = ggml_backend_graph_compute(rpl_backend, gf) == GGML_STATUS_SUCCESS;
     }
+    const int64_t t3 = ggml_time_us();
     ggml_free(ctx);
     rpl_calls   += 1;
     rpl_sync_us += t1 - t0;
     rpl_us      += (ggml_time_us() - t1) + (t0 - t_begin); // graph build + replay, without the sync wait
+    if (getenv("LLAMA_MEM_TIMING") != nullptr) {
+        fprintf(stderr, "RPLTIME wait=%.3f build=%.3f alloc=%.3f comp=%.3f m=%u cell=%u\n",
+                (t1 - t0) / 1e3, (t0 - t_begin) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, m, cell);
+        fflush(stderr);
+    }
     if (rpl_calls % 32 == 0) {
         LLAMA_LOG_INFO("%s: %llu calls, sync wait %.3f ms/call, build + replay %.3f ms/call\n", __func__,
                 (unsigned long long) rpl_calls, rpl_sync_us / 1e3 / rpl_calls, rpl_us / 1e3 / rpl_calls);

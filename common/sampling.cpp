@@ -515,20 +515,20 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     gsmpl->reset();
 }
 
-struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+struct common_sampler * common_sampler_clone(common_sampler * gsmpl, bool with_candidates) {
     return new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .cur     = */ with_candidates ? gsmpl->cur : std::vector<llama_token_data>(),
+        /* .cur_p   = */ with_candidates ? gsmpl->cur_p : llama_token_data_array{},
         /* .rng     = */ gsmpl->rng,
     };
 }
 
-void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+void common_sampler_copy(const common_sampler * src, common_sampler * dst, bool with_candidates) {
     if (!src || !dst || src == dst) {
         return;
     }
@@ -542,9 +542,11 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
 
     dst->params     = src->params;
     dst->prev       = src->prev;
-    dst->cur        = src->cur;
-    dst->cur_p      = src->cur_p;
-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    if (with_candidates) {
+        dst->cur        = src->cur;
+        dst->cur_p      = src->cur_p;
+        dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    }
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
 }

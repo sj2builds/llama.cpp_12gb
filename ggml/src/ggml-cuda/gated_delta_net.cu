@@ -1,5 +1,7 @@
 #include "gated_delta_net.cuh"
 #include "gated-delta-net-mma.cuh"
+#include <cstdlib>
+#include <cstring>
 #include "ggml-cuda/common.cuh"
 
 #include <cstdint>
@@ -353,7 +355,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
-    {
+    // KV-scratch exact wide checks (opt-in GGML_CUDA_MMQ_INVARIANT): the tensor-core chunked path starts at 64 tokens
+    // and sums in a different order than the token-sequential kernel every <= 8-token decode uses, so keep wide
+    // decode batches on the sequential kernel in that mode
+    const char * gdn_inv = getenv("GGML_CUDA_MMQ_INVARIANT");
+    const bool gdn_invariant = gdn_inv != nullptr && gdn_inv[0] != '\0' && strcmp(gdn_inv, "0") != 0;
+    if (!gdn_invariant) {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
         args.state_out = state_d;
         if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {

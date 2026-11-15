@@ -5,6 +5,8 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <array>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -172,6 +174,25 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    bool copy_scratch_from(const llama_kv_cache & src, llama_seq_id seq_id,
+            const std::vector<std::pair<llama_pos, llama_pos>> & ranges);
+
+    // KV-scratch: incremental form of copy_scratch_from. Keeps the cells whose positions are still wanted
+    // and older than invalidate_from, drops everything else, and copies only the missing positions.
+    bool update_scratch_from(const llama_kv_cache & src, llama_seq_id seq_id,
+            const std::vector<std::pair<llama_pos, llama_pos>> & ranges, llama_pos invalidate_from);
+
+    // KV-scratch single-context mode: publish the cell runs the current (stripped) ubatch can attend to
+    void export_stage_cells(const llama_ubatch * ubatch, int64_t n_kv) const;
+
+    // KV-scratch hot rows: publish LLAMA_KV_HOT_CELLS (cell runs of LLAMA_KV_HOT_RANGES below LLAMA_KV_HOT_COMMIT)
+    void export_hot_cells() const;
+    mutable std::string hot_cells_key;   // LLAMA_KV_HOT_RANGES|COMMIT the cached cell runs were built for
+    mutable std::string hot_cells_value;
+
+    // copy {src cell, dst cell, n} row runs of every attention layer's K and V from src into this cache
+    bool copy_scratch_rows(const llama_kv_cache & src, const std::vector<std::array<uint32_t, 3>> & runs);
+
     // The stream holding seq_id's cells.
     uint32_t get_stream(llama_seq_id seq_id) const;
 
@@ -237,6 +258,8 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // R2-5g item 1 (opt-in, LLAMA_STRIP_KV_RANGES_L=<file>): one keep pattern per KV layer
+    void set_input_kq_mask_layered(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -436,6 +459,12 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // R2-5g item 1 (opt-in, LLAMA_STRIP_KV_RANGES_L=<file>): one keep pattern per KV layer, dst is
+    // [n_kv, n_tokens, n_layers_kv, n_stream]. Emulation only, same as set_input_kq_mask otherwise.
+    static bool kv_layers_supported(int64_t n_stream);
+    int32_t get_n_layers_kv() const;
+    std::vector<uint32_t> get_layer_ids_kv() const;
+    void set_input_kq_mask_layered(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
